@@ -12,6 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use steamworks::{AppId, Client, PublishedFileId};
 
 const GMOD_APP_ID: u32 = 4000;
+const GREEN: Color32 = Color32::from_rgb(60, 160, 80);
+const ORANGE: Color32 = Color32::from_rgb(230, 150, 40);
+const RED: Color32 = Color32::from_rgb(210, 70, 70);
+const BLUE: Color32 = Color32::from_rgb(70, 140, 220);
 
 // ---------------------------------------------------------------------
 // Stato condiviso del gruppo
@@ -145,6 +149,42 @@ fn parse_ids(text: &str) -> Vec<String> {
     out
 }
 
+/// Toglie i tag [b], [url=...], [h1]... dalle descrizioni del Workshop e accorcia il testo.
+fn clean_bbcode(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '[' => in_tag = true,
+            ']' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let mut res = String::new();
+    let mut blank = 0;
+    for line in out.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        res.push_str(l);
+        res.push('\n');
+    }
+    let res = res.trim().to_string();
+    if res.chars().count() > 800 {
+        let short: String = res.chars().take(800).collect();
+        format!("{short}…")
+    } else {
+        res
+    }
+}
+
 // ---------------------------------------------------------------------
 // Informazioni sugli oggetti (API web pubblica di Steam, senza chiave)
 // ---------------------------------------------------------------------
@@ -152,6 +192,8 @@ fn parse_ids(text: &str) -> Vec<String> {
 #[derive(Clone, Default)]
 struct Meta {
     title: String,
+    description: String,
+    preview: String,
     ok: bool,
     app: u64,
     vis: u64,
@@ -212,6 +254,8 @@ fn fetch_meta(ids: &[String]) -> Result<BTreeMap<String, Meta>, String> {
                     id,
                     Meta {
                         title: d["title"].as_str().unwrap_or("").to_string(),
+                        description: clean_bbcode(d["description"].as_str().unwrap_or("")),
+                        preview: d["preview_url"].as_str().unwrap_or("").to_string(),
                         ok: d["result"].as_u64() == Some(1),
                         app: d["consumer_app_id"].as_u64().unwrap_or(0),
                         vis: d["visibility"].as_u64().unwrap_or(0),
@@ -225,7 +269,7 @@ fn fetch_meta(ids: &[String]) -> Result<BTreeMap<String, Meta>, String> {
 }
 
 // ---------------------------------------------------------------------
-// Righe, piano di sincronizzazione, azioni
+// Righe, filtri, piano di sincronizzazione, azioni
 // ---------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -239,11 +283,69 @@ enum Status {
 
 fn status_style(s: Status) -> (&'static str, Color32) {
     match s {
-        Status::Missing => ("manca a te", Color32::from_rgb(230, 150, 40)),
-        Status::Remove => ("da rimuovere", Color32::from_rgb(210, 70, 70)),
-        Status::LocalOnly => ("solo tuo", Color32::from_rgb(70, 140, 220)),
-        Status::Ok => ("ok", Color32::from_rgb(60, 160, 80)),
-        Status::Ignored => ("ignorato", Color32::GRAY),
+        Status::Missing => ("Manca a te", ORANGE),
+        Status::Remove => ("Tolto dal gruppo", RED),
+        Status::LocalOnly => ("Solo tuo", BLUE),
+        Status::Ok => ("A posto", GREEN),
+        Status::Ignored => ("Solo per te", Color32::GRAY),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Filter {
+    All,
+    Todo,
+    LocalOnly,
+    Missing,
+    Remove,
+    Ok,
+    Ignored,
+    Problems,
+    Deleted,
+}
+
+impl Filter {
+    const ALL: [Filter; 9] = [
+        Filter::All,
+        Filter::Todo,
+        Filter::LocalOnly,
+        Filter::Missing,
+        Filter::Remove,
+        Filter::Ok,
+        Filter::Ignored,
+        Filter::Problems,
+        Filter::Deleted,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Filter::All => "Tutti gli addon",
+            Filter::Todo => "Da sistemare (manca, tolto o solo tuo)",
+            Filter::LocalOnly => "Solo tuoi (non ancora condivisi)",
+            Filter::Missing => "Mancano a te (li ha il gruppo)",
+            Filter::Remove => "Da rimuovere (tolti dal gruppo)",
+            Filter::Ok => "A posto",
+            Filter::Ignored => "Tenuti solo per te",
+            Filter::Problems => "Con problemi (eliminati, non pubblici...)",
+            Filter::Deleted => "Eliminati o non trovati",
+        }
+    }
+
+    fn matches(self, r: &Row) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Todo => matches!(
+                r.status,
+                Status::Missing | Status::Remove | Status::LocalOnly
+            ),
+            Filter::LocalOnly => r.status == Status::LocalOnly,
+            Filter::Missing => r.status == Status::Missing,
+            Filter::Remove => r.status == Status::Remove,
+            Filter::Ok => r.status == Status::Ok,
+            Filter::Ignored => r.status == Status::Ignored,
+            Filter::Problems => !r.warn.is_empty(),
+            Filter::Deleted => r.deleted,
+        }
     }
 }
 
@@ -275,6 +377,8 @@ enum Action {
     ToggleIgnore,
     AddIds,
     SaveSettings,
+    BrowseFile,
+    NewFile,
 }
 
 /// Esito di una iscrizione/disiscrizione, che Steam ci comunica in modo asincrono.
@@ -304,8 +408,9 @@ struct App {
     steam_rx: Receiver<Done>,
     pending: usize,
     selected: BTreeSet<String>,
+    current: Option<String>,
     filter: String,
-    only_todo: bool,
+    filter_kind: Filter,
     add_input: String,
     plan: Option<Plan>,
     confirm_remove: Option<Vec<String>>,
@@ -314,6 +419,7 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let cfg = Config::load();
         let (client, steam_error) = match Client::init_app(AppId(GMOD_APP_ID)) {
             Ok(c) => (Some(c), String::new()),
@@ -347,8 +453,9 @@ impl App {
             steam_rx,
             pending: 0,
             selected: BTreeSet::new(),
+            current: None,
             filter: String::new(),
-            only_todo: false,
+            filter_kind: Filter::All,
             add_input: String::new(),
             plan: None,
             confirm_remove: None,
@@ -394,7 +501,7 @@ impl App {
         match self.backend() {
             None => {
                 self.shared = Shared::default();
-                self.shared_error = "Imposta il percorso del file condiviso.".to_string();
+                self.shared_error.clear();
             }
             Some(b) => match b.load() {
                 Ok(s) => {
@@ -583,7 +690,7 @@ impl App {
     fn publish(&mut self, ids: &[String], present: bool) -> bool {
         let Some(b) = self.backend() else {
             self.log
-                .push("Imposta prima il file condiviso.".to_string());
+                .push("Scegli prima il file del gruppo (in alto).".to_string());
             return false;
         };
         let by = if self.cfg.nickname.trim().is_empty() {
@@ -613,7 +720,7 @@ impl App {
             }
             Err(e) => {
                 self.log
-                    .push(format!("Salvataggio nel file condiviso fallito: {e}"));
+                    .push(format!("Salvataggio nel file del gruppo fallito: {e}"));
                 false
             }
         }
@@ -622,7 +729,8 @@ impl App {
     fn add_ids(&mut self) {
         let ids = parse_ids(&self.add_input);
         if ids.is_empty() {
-            self.log.push("Nessun ID valido nel campo.".to_string());
+            self.log
+                .push("Non trovo nessun ID o link valido nel campo.".to_string());
             return;
         }
         let found = match fetch_meta(&ids) {
@@ -651,7 +759,8 @@ impl App {
                     self.subscribe(id);
                 }
             }
-            self.log.push(format!("Aggiunti a tutti: {}", good.len()));
+            self.log
+                .push(format!("Condivisi con il gruppo: {}", good.len()));
             self.add_input.clear();
         }
     }
@@ -662,9 +771,14 @@ impl App {
         match a {
             Action::Refresh => {
                 self.reload_all();
-                self.log.push("Aggiornato.".to_string());
+                self.log.push("Lista aggiornata.".to_string());
             }
             Action::Sync => {
+                if self.backend().is_none() {
+                    self.log
+                        .push("Scegli prima il file del gruppo (in alto).".to_string());
+                    return;
+                }
                 self.reload_all();
                 self.plan = Some(self.make_plan());
             }
@@ -700,7 +814,8 @@ impl App {
                             self.subscribe(id);
                         }
                     }
-                    self.log.push(format!("Aggiunti a tutti: {}", ids.len()));
+                    self.log
+                        .push(format!("Condivisi con il gruppo: {}", ids.len()));
                 }
             }
             Action::AskRemove => {
@@ -722,7 +837,8 @@ impl App {
                             }
                         }
                         self.cfg.save();
-                        self.log.push(format!("Rimossi per tutti: {}", ids.len()));
+                        self.log
+                            .push(format!("Tolti a tutto il gruppo: {}", ids.len()));
                     }
                 }
             }
@@ -739,7 +855,44 @@ impl App {
                 self.cfg.shared_path = self.path_input.trim().to_string();
                 self.cfg.nickname = self.nick_input.trim().to_string();
                 self.cfg.save();
+                if let Some(b) = self.backend() {
+                    if !b.path.exists() {
+                        match b.save(&Shared::default()) {
+                            Ok(()) => self
+                                .log
+                                .push(format!("Creato il file del gruppo: {}", b.path.display())),
+                            Err(e) => self
+                                .log
+                                .push(format!("Non riesco a creare il file del gruppo: {e}")),
+                        }
+                    }
+                }
                 self.reload_all();
+            }
+            Action::BrowseFile => {
+                let mut dlg = rfd::FileDialog::new()
+                    .set_title("Scegli il file del gruppo")
+                    .add_filter("File JSON", &["json"]);
+                if let Some(h) = dirs::home_dir() {
+                    dlg = dlg.set_directory(h);
+                }
+                if let Some(p) = dlg.pick_file() {
+                    self.path_input = p.display().to_string();
+                    self.run(Action::SaveSettings);
+                }
+            }
+            Action::NewFile => {
+                let mut dlg = rfd::FileDialog::new()
+                    .set_title("Crea il file del gruppo")
+                    .set_file_name("gmod-workshop-sync.json")
+                    .add_filter("File JSON", &["json"]);
+                if let Some(h) = dirs::home_dir() {
+                    dlg = dlg.set_directory(h);
+                }
+                if let Some(p) = dlg.save_file() {
+                    self.path_input = p.display().to_string();
+                    self.run(Action::SaveSettings);
+                }
             }
         }
     }
@@ -750,45 +903,63 @@ impl App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             if self.client.is_some() {
-                ui.label(
-                    RichText::new("Steam: connesso (Garry's Mod)")
-                        .color(Color32::from_rgb(60, 160, 80)),
-                );
+                ui.label(RichText::new("✔ Collegato a Steam").color(GREEN));
             } else {
-                ui.label(
-                    RichText::new(self.steam_error.clone()).color(Color32::from_rgb(210, 70, 70)),
-                );
+                ui.label(RichText::new(self.steam_error.clone()).color(RED));
             }
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label("File condiviso:");
+                ui.label(RichText::new("File del gruppo:").strong());
                 ui.add(
                     egui::TextEdit::singleline(&mut self.path_input)
-                        .desired_width(360.0)
-                        .hint_text("es. D:\\Dropbox\\gmod-workshop.json"),
+                        .desired_width(380.0)
+                        .hint_text("nessun file scelto"),
                 );
-                ui.label("Nome:");
-                ui.add(egui::TextEdit::singleline(&mut self.nick_input).desired_width(110.0));
-                if ui.button("Salva").clicked() {
+                if ui
+                    .button("Sfoglia…")
+                    .on_hover_text("Scegli il file del gruppo, se esiste già (te lo passa chi l'ha creato)")
+                    .clicked()
+                {
+                    actions.push(Action::BrowseFile);
+                }
+                if ui
+                    .button("Crea nuovo…")
+                    .on_hover_text("Crea un file del gruppo nuovo e vuoto. Lo fa solo il primo del gruppo")
+                    .clicked()
+                {
+                    actions.push(Action::NewFile);
+                }
+                if ui
+                    .button("Salva")
+                    .on_hover_text("Usa il percorso scritto qui a sinistra. Se il file non esiste lo crea")
+                    .clicked()
+                {
                     actions.push(Action::SaveSettings);
                 }
             });
+            ui.label(
+                RichText::new("È il file JSON che tutti voi usate per restare allineati: mettilo in una cartella che già condividete (Dropbox, Syncthing, Drive...). Il primo del gruppo lo crea, gli altri lo scelgono con Sfoglia.")
+                    .small(),
+            );
             if !self.shared_error.is_empty() {
-                ui.label(
-                    RichText::new(self.shared_error.clone()).color(Color32::from_rgb(230, 150, 40)),
-                );
+                ui.label(RichText::new(self.shared_error.clone()).color(ORANGE));
             }
+            egui::CollapsingHeader::new("Altre impostazioni").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Il tuo nome (compare come autore delle modifiche):");
+                    ui.add(egui::TextEdit::singleline(&mut self.nick_input).desired_width(140.0));
+                    if ui.button("Salva nome").clicked() {
+                        actions.push(Action::SaveSettings);
+                    }
+                });
+            });
             let todo = rows
                 .iter()
-                .filter(|r| {
-                    matches!(
-                        r.status,
-                        Status::Missing | Status::Remove | Status::LocalOnly
-                    )
-                })
+                .filter(|r| Filter::Todo.matches(r))
                 .count();
             let shared_count = self.shared.items.values().filter(|e| e.present).count();
             ui.label(format!(
-                "Iscritti: {}    Nel gruppo: {}    Da sistemare: {}",
+                "Tue iscrizioni: {}    Addon del gruppo: {}    Da sistemare: {}",
                 self.local.len(),
                 shared_count,
                 todo
@@ -800,9 +971,10 @@ impl App {
     fn bottom_panel(&self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("log")
             .resizable(true)
-            .min_height(70.0)
-            .default_height(100.0)
+            .min_height(60.0)
+            .default_height(80.0)
             .show(ctx, |ui| {
+                ui.label(RichText::new("Registro delle operazioni").small().strong());
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
@@ -814,57 +986,158 @@ impl App {
             });
     }
 
+    fn detail_panel(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.current.clone() else {
+            return;
+        };
+        let meta = self.meta.get(&id).cloned();
+        let title = self.title_of(&id);
+        egui::SidePanel::right("detail")
+            .resizable(true)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Anteprima");
+                    if ui.small_button("✕ Chiudi").clicked() {
+                        self.current = None;
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.label(RichText::new(title.as_str()).strong());
+                    ui.add_space(4.0);
+                    match &meta {
+                        Some(m) => {
+                            if !m.preview.is_empty() {
+                                let w = ui.available_width();
+                                ui.add(
+                                    egui::Image::new(m.preview.as_str())
+                                        .max_width(w)
+                                        .max_height(220.0),
+                                );
+                                ui.add_space(4.0);
+                            }
+                            let warn = m.warning();
+                            if !warn.is_empty() {
+                                ui.label(RichText::new(format!("⚠ {warn}")).color(ORANGE));
+                            }
+                            if m.description.is_empty() {
+                                ui.label("Nessuna descrizione.");
+                            } else {
+                                ui.label(m.description.as_str());
+                            }
+                        }
+                        None => {
+                            ui.label("Sto scaricando le informazioni...");
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.hyperlink_to(
+                        "Apri la pagina nel Workshop",
+                        format!("https://steamcommunity.com/sharedfiles/filedetails/?id={id}"),
+                    );
+                });
+            });
+    }
+
     fn central_panel(&mut self, ctx: &egui::Context, rows: &[Row], actions: &mut Vec<Action>) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            // 1. Sincronizzazione
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("Cerca per titolo o ID...")
-                        .desired_width(220.0),
-                );
-                ui.checkbox(&mut self.only_todo, "Solo da sistemare");
-                if ui.button("Aggiorna").clicked() {
-                    actions.push(Action::Refresh);
-                }
-                if ui.button("Sincronizza…").clicked() {
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("⟳ Sincronizza con il gruppo").strong(),
+                    ))
+                    .on_hover_text("Confronta le tue iscrizioni con quelle del gruppo. Ti mostro cosa verrebbe aggiunto o tolto e applichi solo se confermi")
+                    .clicked()
+                {
                     actions.push(Action::Sync);
                 }
+                if ui
+                    .button("Aggiorna la lista")
+                    .on_hover_text("Rilegge le tue iscrizioni da Steam e il file del gruppo")
+                    .clicked()
+                {
+                    actions.push(Action::Refresh);
+                }
             });
+            ui.add_space(4.0);
+
+            // 2. Filtri
+            ui.horizontal(|ui| {
+                ui.label("Mostra:");
+                egui::ComboBox::from_id_salt("filtro")
+                    .width(280.0)
+                    .selected_text(self.filter_kind.label())
+                    .show_ui(ui, |ui| {
+                        for f in Filter::ALL {
+                            ui.selectable_value(&mut self.filter_kind, f, f.label());
+                        }
+                    });
+                ui.label("Cerca:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("titolo o ID")
+                        .desired_width(180.0),
+                );
+            });
+
+            // 3. Azioni sugli addon selezionati
             ui.horizontal(|ui| {
                 let has = !self.selected.is_empty();
+                let all_ignored = has && self.selected.iter().all(|id| self.cfg.ignored.contains(id));
+                ui.label(format!("Con i {} addon selezionati:", self.selected.len()));
                 if ui
-                    .add_enabled(has, egui::Button::new("Aggiungi a tutti"))
+                    .add_enabled(has, egui::Button::new("Condividi con il gruppo"))
+                    .on_hover_text("Li dai a tutto il gruppo: a ognuno compariranno come 'Manca a te' alla prossima sincronizzazione")
+                    .on_disabled_hover_text("Prima spunta uno o più addon nella lista")
                     .clicked()
                 {
                     actions.push(Action::AddSelected);
                 }
                 if ui
-                    .add_enabled(has, egui::Button::new("Rimuovi a tutti"))
+                    .add_enabled(has, egui::Button::new("Togli a tutto il gruppo"))
+                    .on_hover_text("Li togli a tutto il gruppo: a ognuno compariranno come 'Tolto dal gruppo' alla prossima sincronizzazione. Chiede conferma")
+                    .on_disabled_hover_text("Prima spunta uno o più addon nella lista")
                     .clicked()
                 {
                     actions.push(Action::AskRemove);
                 }
+                let ignore_label = if all_ignored {
+                    "Rimetti nella sincronizzazione"
+                } else {
+                    "Tieni solo per me"
+                };
                 if ui
-                    .add_enabled(has, egui::Button::new("Ignora / non ignorare"))
+                    .add_enabled(has, egui::Button::new(ignore_label))
+                    .on_hover_text("Gli addon 'solo per te' non vengono né aggiunti né tolti dalla sincronizzazione")
+                    .on_disabled_hover_text("Prima spunta uno o più addon nella lista")
                     .clicked()
                 {
                     actions.push(Action::ToggleIgnore);
                 }
-                ui.separator();
-                ui.label("ID o link:");
-                ui.add(egui::TextEdit::singleline(&mut self.add_input).desired_width(220.0));
-                if ui.button("Aggiungi ID a tutti").clicked() {
+            });
+
+            // 4. Addon nuovo da ID o link
+            ui.horizontal(|ui| {
+                ui.label("Addon nuovo (link o ID dal Workshop):");
+                ui.add(egui::TextEdit::singleline(&mut self.add_input).desired_width(260.0));
+                if ui
+                    .button("Aggiungi per tutti")
+                    .on_hover_text("Controlla che l'addon esista e sia di Garry's Mod, poi lo dà a tutto il gruppo e te lo iscrive subito")
+                    .clicked()
+                {
                     actions.push(Action::AddIds);
                 }
             });
             ui.separator();
 
             let f = self.filter.to_lowercase();
-            let only_todo = self.only_todo;
+            let kind = self.filter_kind;
             let visible: Vec<&Row> = rows
                 .iter()
                 .filter(|r| {
-                    (!only_todo || !matches!(r.status, Status::Ok | Status::Ignored))
+                    kind.matches(r)
                         && (f.is_empty()
                             || r.title.to_lowercase().contains(&f)
                             || r.id.contains(&f))
@@ -872,20 +1145,31 @@ impl App {
                 .collect();
 
             ui.horizontal(|ui| {
-                if ui.small_button("Seleziona visibili").clicked() {
+                if ui.small_button("Spunta tutti quelli mostrati").clicked() {
                     for r in &visible {
                         self.selected.insert(r.id.clone());
                     }
                 }
-                if ui.small_button("Deseleziona").clicked() {
+                if ui.small_button("Togli tutte le spunte").clicked() {
                     self.selected.clear();
                 }
-                ui.label(format!(
-                    "{} elementi, {} selezionati",
-                    visible.len(),
-                    self.selected.len()
-                ));
+                ui.label(
+                    RichText::new(format!(
+                        "{} addon mostrati. Tocca un titolo per vederne l'anteprima.",
+                        visible.len()
+                    ))
+                    .small(),
+                );
             });
+
+            if visible.is_empty() {
+                ui.add_space(8.0);
+                if rows.is_empty() {
+                    ui.label("Nessun addon da mostrare. Se è la prima volta, scegli o crea il file del gruppo in alto e premi Salva.");
+                } else {
+                    ui.label("Nessun addon corrisponde al filtro scelto.");
+                }
+            }
 
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -912,12 +1196,16 @@ impl App {
                                 }
                                 let (txt, col) = status_style(r.status);
                                 ui.label(RichText::new(txt).color(col));
-                                ui.label(r.title.as_str());
+                                let is_current = self.current.as_deref() == Some(r.id.as_str());
+                                if ui
+                                    .selectable_label(is_current, r.title.as_str())
+                                    .on_hover_text("Tocca per vedere immagine e descrizione")
+                                    .clicked()
+                                {
+                                    self.current = Some(r.id.clone());
+                                }
                                 ui.label(RichText::new(r.id.as_str()).monospace());
-                                ui.label(
-                                    RichText::new(r.warn.as_str())
-                                        .color(Color32::from_rgb(210, 140, 40)),
-                                );
+                                ui.label(RichText::new(r.warn.as_str()).color(ORANGE));
                                 ui.end_row();
                             }
                         });
@@ -929,7 +1217,7 @@ impl App {
         let Some(plan) = self.plan.as_mut() else {
             return;
         };
-        egui::Window::new("Anteprima sincronizzazione")
+        egui::Window::new("Cosa cambierà")
             .collapsible(false)
             .resizable(true)
             .default_width(520.0)
@@ -941,14 +1229,20 @@ impl App {
                     .max_height(320.0)
                     .show(ui, |ui| {
                         if !plan.subscribe.is_empty() {
-                            ui.strong(format!("Da iscrivere ({})", plan.subscribe.len()));
+                            ui.strong(format!(
+                                "Verranno aggiunti alle tue iscrizioni ({})",
+                                plan.subscribe.len()
+                            ));
                             for (_, title, on) in plan.subscribe.iter_mut() {
                                 ui.checkbox(on, title.as_str());
                             }
                         }
                         if !plan.unsubscribe.is_empty() {
                             ui.add_space(6.0);
-                            ui.strong(format!("Da disiscrivere ({})", plan.unsubscribe.len()));
+                            ui.strong(format!(
+                                "Verranno tolti dalle tue iscrizioni ({})",
+                                plan.unsubscribe.len()
+                            ));
                             for (_, title, on) in plan.unsubscribe.iter_mut() {
                                 ui.checkbox(on, title.as_str());
                             }
@@ -969,7 +1263,7 @@ impl App {
                     }
                 });
                 ui.label(
-                    RichText::new("Meglio a Garry's Mod chiuso. Prima di applicare salvo un backup delle iscrizioni.")
+                    RichText::new("Meglio a Garry's Mod chiuso. Prima di applicare salvo un backup delle tue iscrizioni.")
                         .small(),
                 );
             });
@@ -984,11 +1278,8 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Rimuovere {} elementi per TUTTO il gruppo?",
-                    ids.len()
-                ));
-                ui.label("Chi sincronizza dopo di te li perderà dalle iscrizioni.");
+                ui.label(format!("Togliere {} addon a TUTTO il gruppo?", ids.len()));
+                ui.label("Chi sincronizza dopo di te li perderà dalle sue iscrizioni.");
                 for t in &titles {
                     ui.label(format!("• {t}"));
                 }
@@ -996,7 +1287,7 @@ impl App {
                     ui.label(format!("… e altri {}", ids.len() - titles.len()));
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Rimuovi").clicked() {
+                    if ui.button("Sì, togli a tutti").clicked() {
                         actions.push(Action::ConfirmRemove);
                     }
                     if ui.button("Annulla").clicked() {
@@ -1014,6 +1305,7 @@ impl eframe::App for App {
         let mut actions: Vec<Action> = Vec::new();
         self.top_panel(ctx, &mut actions, &rows);
         self.bottom_panel(ctx);
+        self.detail_panel(ctx);
         self.central_panel(ctx, &rows, &mut actions);
         self.plan_window(ctx, &mut actions);
         self.confirm_window(ctx, &mut actions);
@@ -1026,8 +1318,8 @@ impl eframe::App for App {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 640.0])
-            .with_min_inner_size([720.0, 420.0]),
+            .with_inner_size([1100.0, 680.0])
+            .with_min_inner_size([760.0, 440.0]),
         ..Default::default()
     };
     eframe::run_native(
