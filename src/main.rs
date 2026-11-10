@@ -398,7 +398,6 @@ struct App {
     steam_error: String,
     cfg: Config,
     path_input: String,
-    nick_input: String,
     shared: Shared,
     shared_error: String,
     local: Vec<u64>,
@@ -432,18 +431,12 @@ impl App {
         };
         let (steam_tx, steam_rx) = channel();
         let path_input = cfg.shared_path.clone();
-        let nick_input = if cfg.nickname.is_empty() {
-            default_nick()
-        } else {
-            cfg.nickname.clone()
-        };
         let mut app = App {
             ctx: cc.egui_ctx.clone(),
             client,
             steam_error,
             cfg,
             path_input,
-            nick_input,
             shared: Shared::default(),
             shared_error: String::new(),
             local: Vec::new(),
@@ -853,7 +846,6 @@ impl App {
             Action::AddIds => self.add_ids(),
             Action::SaveSettings => {
                 self.cfg.shared_path = self.path_input.trim().to_string();
-                self.cfg.nickname = self.nick_input.trim().to_string();
                 self.cfg.save();
                 if let Some(b) = self.backend() {
                     if !b.path.exists() {
@@ -944,15 +936,6 @@ impl App {
             if !self.shared_error.is_empty() {
                 ui.label(RichText::new(self.shared_error.clone()).color(ORANGE));
             }
-            egui::CollapsingHeader::new("Altre impostazioni").show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Il tuo nome (compare come autore delle modifiche):");
-                    ui.add(egui::TextEdit::singleline(&mut self.nick_input).desired_width(140.0));
-                    if ui.button("Salva nome").clicked() {
-                        actions.push(Action::SaveSettings);
-                    }
-                });
-            });
             let todo = rows
                 .iter()
                 .filter(|r| Filter::Todo.matches(r))
@@ -1042,6 +1025,19 @@ impl App {
 
     fn central_panel(&mut self, ctx: &egui::Context, rows: &[Row], actions: &mut Vec<Action>) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Aggiungere un addon nuovo
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("＋ Aggiungi addon:").strong());
+                ui.add(egui::TextEdit::singleline(&mut self.add_input).desired_width(320.0).hint_text("incolla qui il link o l'ID del Workshop"));
+                if ui
+                    .add(egui::Button::new("Aggiungi per tutti"))
+                    .on_hover_text("Controlla che l'addon esista e sia di Garry's Mod, poi lo dà a tutto il gruppo e te lo iscrive subito")
+                    .clicked()
+                {
+                    actions.push(Action::AddIds);
+                }
+            });
+            ui.add_space(4.0);
             // 1. Sincronizzazione
             ui.horizontal(|ui| {
                 if ui
@@ -1118,18 +1114,6 @@ impl App {
                 }
             });
 
-            // 4. Addon nuovo da ID o link
-            ui.horizontal(|ui| {
-                ui.label("Addon nuovo (link o ID dal Workshop):");
-                ui.add(egui::TextEdit::singleline(&mut self.add_input).desired_width(260.0));
-                if ui
-                    .button("Aggiungi per tutti")
-                    .on_hover_text("Controlla che l'addon esista e sia di Garry's Mod, poi lo dà a tutto il gruppo e te lo iscrive subito")
-                    .clicked()
-                {
-                    actions.push(Action::AddIds);
-                }
-            });
             ui.separator();
 
             let f = self.filter.to_lowercase();
@@ -1171,12 +1155,13 @@ impl App {
                 }
             }
 
+            let mut row_action: Option<(String, bool)> = None;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     egui::Grid::new("items")
                         .striped(true)
-                        .num_columns(5)
+                        .num_columns(6)
                         .spacing([12.0, 4.0])
                         .show(ui, |ui| {
                             ui.label("");
@@ -1184,6 +1169,7 @@ impl App {
                             ui.strong("Titolo");
                             ui.strong("ID");
                             ui.strong("Avviso");
+                            ui.strong("Azioni");
                             ui.end_row();
                             for r in &visible {
                                 let mut sel = self.selected.contains(&r.id);
@@ -1206,10 +1192,36 @@ impl App {
                                 }
                                 ui.label(RichText::new(r.id.as_str()).monospace());
                                 ui.label(RichText::new(r.warn.as_str()).color(ORANGE));
+                                ui.horizontal(|ui| {
+                                    if matches!(r.status, Status::LocalOnly | Status::Ignored)
+                                        && ui
+                                            .small_button("Condividi")
+                                            .on_hover_text("Dallo a tutto il gruppo")
+                                            .clicked()
+                                    {
+                                        row_action = Some((r.id.clone(), true));
+                                    }
+                                    if ui
+                                        .small_button("Togli a tutti")
+                                        .on_hover_text("Lo toglie a tutto il gruppo (chiede conferma)")
+                                        .clicked()
+                                    {
+                                        row_action = Some((r.id.clone(), false));
+                                    }
+                                });
                                 ui.end_row();
                             }
                         });
                 });
+            if let Some((id, share)) = row_action {
+                self.selected.clear();
+                self.selected.insert(id);
+                actions.push(if share {
+                    Action::AddSelected
+                } else {
+                    Action::AskRemove
+                });
+            }
         });
     }
 
