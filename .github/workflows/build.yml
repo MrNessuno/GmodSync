@@ -1,0 +1,59 @@
+name: Build eseguibili
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-22.04
+          - name: windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Librerie di sistema (Linux)
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compila
+        run: cargo build --release
+
+      - name: Pacchetto Linux
+        if: matrix.name == 'linux'
+        run: |
+          mkdir dist
+          cp target/release/gmod-ws-sync dist/
+          cp target/release/build/steamworks-sys-*/out/libsteam_api.so dist/
+          printf '#!/bin/sh\ncd "$(dirname "$0")"\nLD_LIBRARY_PATH=. exec ./gmod-ws-sync\n' > dist/avvia.sh
+          chmod +x dist/avvia.sh dist/gmod-ws-sync
+          tar -czf gmod-ws-sync-linux.tar.gz -C dist .
+
+      - name: Pacchetto Windows
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target\release\gmod-ws-sync.exe dist\
+          Copy-Item target\release\build\steamworks-sys-*\out\steam_api64.dll dist\
+          Compress-Archive -Path dist\* -DestinationPath gmod-ws-sync-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gmod-ws-sync-${{ matrix.name }}
+          path: |
+            gmod-ws-sync-linux.tar.gz
+            gmod-ws-sync-windows.zip
+          if-no-files-found: ignore
