@@ -1,0 +1,11 @@
+[package]
+name = "gmod-ws-sync-launcher"
+version = "0.1.0"
+edition = "2021"
+
+# Pacchetto separato: contiene il programma vero e la libreria di Steam,
+# così si distribuisce un solo file.
+[workspace]
+
+[profile.release]
+opt-level = "s"

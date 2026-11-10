@@ -1,10 +1,15 @@
 name: Build eseguibili
 
 on:
-  workflow_dispatch:
   push:
     branches: [main]
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      versione:
+        description: "Se compilato (es. v0.1.0) crea una release con questo nome"
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -32,35 +37,36 @@ jobs:
       - name: Compila
         run: cargo build --release
 
-      - name: Pacchetto Linux
+      # Il programma vero e la libreria di Steam vengono messi dentro un
+      # avviatore, così si distribuisce un solo file.
+      - name: File singolo (Linux)
         if: matrix.name == 'linux'
         run: |
-          mkdir dist
-          cp target/release/gmod-ws-sync dist/
-          cp target/release/build/steamworks-sys-*/out/libsteam_api.so dist/
-          printf '#!/bin/sh\ncd "$(dirname "$0")"\nLD_LIBRARY_PATH=. exec ./gmod-ws-sync\n' > dist/avvia.sh
-          chmod +x dist/avvia.sh dist/gmod-ws-sync
-          tar -czf gmod-ws-sync-linux.tar.gz -C dist .
+          export GMOD_EXE="$PWD/target/release/gmod-ws-sync"
+          export GMOD_LIB="$(ls "$PWD"/target/release/build/steamworks-sys-*/out/libsteam_api.so | head -n1)"
+          cargo build --release --manifest-path launcher/Cargo.toml
+          cp launcher/target/release/gmod-ws-sync-launcher gmod-ws-sync-linux
+          chmod +x gmod-ws-sync-linux
 
-      - name: Pacchetto Windows
+      - name: File singolo (Windows)
         if: matrix.name == 'windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist | Out-Null
-          Copy-Item target\release\gmod-ws-sync.exe dist\
-          Copy-Item target\release\build\steamworks-sys-*\out\steam_api64.dll dist\
-          Compress-Archive -Path dist\* -DestinationPath gmod-ws-sync-windows.zip
+          $env:GMOD_EXE = (Resolve-Path target\release\gmod-ws-sync.exe).Path
+          $env:GMOD_LIB = (Get-ChildItem target\release\build\steamworks-sys-*\out\steam_api64.dll | Select-Object -First 1).FullName
+          cargo build --release --manifest-path launcher/Cargo.toml
+          Copy-Item launcher\target\release\gmod-ws-sync-launcher.exe gmod-ws-sync-windows.exe
 
       - uses: actions/upload-artifact@v4
         with:
           name: gmod-ws-sync-${{ matrix.name }}
           path: |
-            gmod-ws-sync-linux.tar.gz
-            gmod-ws-sync-windows.zip
+            gmod-ws-sync-linux
+            gmod-ws-sync-windows.exe
           if-no-files-found: ignore
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.versione != ''
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -73,16 +79,19 @@ jobs:
       - name: Crea la release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSIONE: ${{ inputs.versione || github.ref_name }}
         run: |
           cat > note.md <<'NOTE'
           Programma per tenere allineate le iscrizioni al Workshop di Garry's Mod tra amici.
 
-          **Windows:** scarica `gmod-ws-sync-windows.zip`, estrai tutto in una cartella e avvia `gmod-ws-sync.exe`.
-          **Linux:** scarica `gmod-ws-sync-linux.tar.gz`, estrai e avvia `avvia.sh`.
+          **Windows:** scarica `gmod-ws-sync-windows.exe` e avvialo.
+          **Linux:** scarica `gmod-ws-sync-linux`, rendilo eseguibile (tasto destro → Proprietà → Permessi, oppure `chmod +x gmod-ws-sync-linux`) e avvialo.
 
+          È un file singolo: al primo avvio prepara da solo quello che gli serve in una cartella dell'utente.
           Serve Steam aperto con l'account che possiede Garry's Mod. Al primo avvio scegli dove tenere la lista del gruppo: collezione Steam, cartella condivisa o repository GitHub.
           NOTE
-          gh release create "$GITHUB_REF_NAME" pacchetti/* \
+          gh release create "$VERSIONE" pacchetti/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Garry's Mod Workshop Sync $GITHUB_REF_NAME" \
+            --target "$GITHUB_SHA" \
+            --title "Garry's Mod Workshop Sync $VERSIONE" \
             --notes-file note.md
