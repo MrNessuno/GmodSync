@@ -1,16 +1,24 @@
 // Garry's Mod Workshop Sync
 // Tiene allineate le iscrizioni al Workshop di un gruppo di amici.
 // Richiede Steam aperto, con l'account che possiede Garry's Mod.
+//
+// La lista del gruppo può stare in tre posti (si sceglie in Impostazioni):
+//  - una collezione del Workshop di Steam (gli amici sono collaboratori)
+//  - un file JSON in una cartella condivisa (Dropbox, Drive, Syncthing...)
+//  - un file JSON in un repository GitHub
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use steamworks::{AppId, Client, PublishedFileId};
+use steamworks::{AppId, Client, FileType, PublishedFileId};
 
 const GMOD_APP_ID: u32 = 4000;
 const GREEN: Color32 = Color32::from_rgb(60, 160, 80);
@@ -18,14 +26,14 @@ const ORANGE: Color32 = Color32::from_rgb(230, 150, 40);
 const RED: Color32 = Color32::from_rgb(210, 70, 70);
 const BLUE: Color32 = Color32::from_rgb(70, 140, 220);
 const HISTORY_MAX: usize = 1000;
-const API: &str = "https://api.steampowered.com/ISteamRemoteStorage";
+const STEAM_API: &str = "https://api.steampowered.com/ISteamRemoteStorage";
+const CONFLICT: &str = "conflitto";
 
 // ---------------------------------------------------------------------
-// Stato condiviso del gruppo
+// Stato del gruppo
 // ---------------------------------------------------------------------
 
-/// Una riga del file condiviso: present = true vuol dire "tutti devono averlo",
-/// present = false vuol dire "tutti devono toglierlo".
+/// present = true: tutti devono averlo. present = false: tutti devono toglierlo.
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct Entry {
     present: bool,
@@ -52,8 +60,14 @@ struct Shared {
     history: Vec<HistoryEntry>,
 }
 
-/// Dove vive lo stato condiviso. Per ora esiste solo il file; in futuro
-/// si possono aggiungere altri modi implementando questo trait.
+fn parse_shared(text: &str) -> Result<Shared, String> {
+    if text.trim().is_empty() {
+        return Ok(Shared::default());
+    }
+    serde_json::from_str(text).map_err(|e| format!("lista del gruppo non valida: {e}"))
+}
+
+/// Un posto dove salvare la lista come documento JSON (file o GitHub).
 trait Backend {
     fn load(&self) -> Result<Shared, String>;
     fn save(&self, shared: &Shared) -> Result<(), String>;
@@ -69,10 +83,13 @@ impl Backend for FileBackend {
             return Ok(Shared::default());
         }
         let text = std::fs::read_to_string(&self.path).map_err(|e| format!("lettura: {e}"))?;
-        if text.trim().is_empty() {
-            return Ok(Shared::default());
+        let mut shared = parse_shared(&text)?;
+        // Se due persone salvano insieme, Dropbox/Drive/Syncthing creano una
+        // "copia in conflitto": la uniamo, così nessuna aggiunta va persa.
+        for other in self.conflict_copies() {
+            merge_shared(&mut shared, other);
         }
-        serde_json::from_str(&text).map_err(|e| format!("file del gruppo non valido: {e}"))
+        Ok(shared)
     }
 
     fn save(&self, shared: &Shared) -> Result<(), String> {
@@ -88,27 +105,219 @@ impl Backend for FileBackend {
     }
 }
 
-/// Rilegge il file, applica la modifica e lo riscrive, così si perdono meno
-/// modifiche fatte da altri nel frattempo.
-fn mutate(backend: &dyn Backend, f: impl FnOnce(&mut Shared)) -> Result<Shared, String> {
-    let mut shared = backend.load()?;
-    f(&mut shared);
-    backend.save(&shared)?;
-    Ok(shared)
+impl FileBackend {
+    fn conflict_copies(&self) -> Vec<Shared> {
+        let mut out = Vec::new();
+        let Some(stem) = self.path.file_stem() else {
+            return out;
+        };
+        let stem = stem.to_string_lossy().to_lowercase();
+        let dir = match self.path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return out;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p == self.path {
+                continue;
+            }
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if !name.ends_with(".json") || !name.starts_with(&stem) {
+                continue;
+            }
+            let rest = &name[stem.len()..];
+            if !(rest.contains("conflict") || rest.contains("conflitto") || rest.contains('(')) {
+                continue;
+            }
+            if let Ok(t) = std::fs::read_to_string(&p) {
+                if let Ok(s) = parse_shared(&t) {
+                    out.push(s);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Unisce due versioni della lista: per ogni addon vince la modifica più recente.
+fn merge_shared(base: &mut Shared, other: Shared) {
+    for (id, e) in other.items {
+        let newer = match base.items.get(&id) {
+            Some(b) => e.ts > b.ts,
+            None => true,
+        };
+        if newer {
+            base.items.insert(id, e);
+        }
+    }
+    base.history.extend(other.history);
+    base.history.sort_by(|a, b| a.ts.cmp(&b.ts));
+    base.history
+        .dedup_by(|a, b| a.ts == b.ts && a.id == b.id && a.by == b.by && a.added == b.added);
+}
+
+struct GitHubBackend {
+    repo: String,
+    path: String,
+    token: String,
+    sha: RefCell<Option<String>>,
+}
+
+impl GitHubBackend {
+    fn url(&self) -> String {
+        format!(
+            "https://api.github.com/repos/{}/contents/{}",
+            self.repo.trim().trim_matches('/'),
+            self.path.trim().trim_start_matches('/')
+        )
+    }
+
+    fn req(&self, method: &str) -> ureq::Request {
+        agent()
+            .request(method, &self.url())
+            .set("Authorization", &format!("Bearer {}", self.token.trim()))
+            .set("Accept", "application/vnd.github+json")
+            .set("X-GitHub-Api-Version", "2022-11-28")
+            .set("User-Agent", "gmod-ws-sync")
+    }
+}
+
+fn github_error(code: u16) -> String {
+    match code {
+        401 => "GitHub: token non valido o scaduto".to_string(),
+        403 => "GitHub: il token non ha il permesso su questo repository".to_string(),
+        404 => "GitHub: repository non trovato, o il token non ci ha accesso".to_string(),
+        409 | 422 => CONFLICT.to_string(),
+        c => format!("GitHub: errore {c}"),
+    }
+}
+
+impl Backend for GitHubBackend {
+    fn load(&self) -> Result<Shared, String> {
+        let r = self.req("GET").query("t", &now().to_string()).call();
+        match r {
+            Ok(resp) => {
+                let v: serde_json::Value = resp
+                    .into_json()
+                    .map_err(|e| format!("GitHub: risposta non valida: {e}"))?;
+                *self.sha.borrow_mut() = v["sha"].as_str().map(|s| s.to_string());
+                let content: String = v["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                let bytes = B64
+                    .decode(content)
+                    .map_err(|e| format!("GitHub: contenuto non leggibile: {e}"))?;
+                parse_shared(&String::from_utf8_lossy(&bytes))
+            }
+            Err(ureq::Error::Status(404, _)) => {
+                // Il file non c'è ancora: verrà creato al primo salvataggio.
+                *self.sha.borrow_mut() = None;
+                Ok(Shared::default())
+            }
+            Err(ureq::Error::Status(code, _)) => Err(github_error(code)),
+            Err(e) => Err(format!("GitHub non raggiungibile: {e}")),
+        }
+    }
+
+    fn save(&self, shared: &Shared) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(shared).map_err(|e| e.to_string())?;
+        let mut body = serde_json::json!({
+            "message": "Aggiornamento lista Garry's Mod Workshop Sync",
+            "content": B64.encode(text.as_bytes()),
+        });
+        if let Some(sha) = self.sha.borrow().clone() {
+            body["sha"] = serde_json::Value::String(sha);
+        }
+        match self.req("PUT").send_json(body) {
+            Ok(resp) => {
+                if let Ok(v) = resp.into_json::<serde_json::Value>() {
+                    *self.sha.borrow_mut() = v["content"]["sha"].as_str().map(|s| s.to_string());
+                }
+                Ok(())
+            }
+            Err(ureq::Error::Status(code, _)) => Err(github_error(code)),
+            Err(e) => Err(format!("GitHub non raggiungibile: {e}")),
+        }
+    }
+}
+
+/// Rilegge la lista, applica la modifica e la riscrive. Se nel frattempo
+/// qualcun altro l'ha cambiata (conflitto su GitHub) riprova.
+fn mutate(backend: &dyn Backend, f: impl Fn(&mut Shared)) -> Result<Shared, String> {
+    let mut last = String::new();
+    for _ in 0..3 {
+        let mut shared = backend.load()?;
+        f(&mut shared);
+        match backend.save(&shared) {
+            Ok(()) => return Ok(shared),
+            Err(e) if e == CONFLICT => {
+                last = e;
+                std::thread::sleep(Duration::from_millis(700));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(format!(
+        "{last}: la lista è stata cambiata da un altro nello stesso momento, riprova"
+    ))
 }
 
 // ---------------------------------------------------------------------
 // Impostazioni locali
 // ---------------------------------------------------------------------
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+enum Mode {
+    #[default]
+    File,
+    Steam,
+    GitHub,
+}
+
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Steam => "Collezione Steam",
+            Mode::File => "Cartella condivisa",
+            Mode::GitHub => "Repository GitHub",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct Config {
     #[serde(default)]
+    mode: Mode,
+    #[serde(default)]
     shared_path: String,
+    #[serde(default)]
+    collection: String,
+    #[serde(default)]
+    gh_repo: String,
+    #[serde(default)]
+    gh_path: String,
+    #[serde(default)]
+    gh_token: String,
     #[serde(default)]
     nickname: String,
     #[serde(default)]
     ignored: BTreeSet<String>,
+    // Memoria della collezione Steam, per capire cosa è stato tolto.
+    #[serde(default)]
+    col_state_for: String,
+    #[serde(default)]
+    col_seen: BTreeSet<String>,
+    #[serde(default)]
+    col_present: BTreeSet<String>,
 }
 
 fn data_dir() -> PathBuf {
@@ -131,6 +340,62 @@ impl Config {
         if let Ok(t) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(data_dir().join("config.json"), t);
         }
+    }
+
+    fn collection_id(&self) -> String {
+        parse_ids(&self.collection)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
+
+    fn gh_file(&self) -> String {
+        if self.gh_path.trim().is_empty() {
+            "gmod-workshop-sync.json".to_string()
+        } else {
+            self.gh_path.trim().to_string()
+        }
+    }
+
+    fn configured(&self) -> bool {
+        match self.mode {
+            Mode::File => !self.shared_path.trim().is_empty(),
+            Mode::Steam => !self.collection_id().is_empty(),
+            Mode::GitHub => !self.gh_repo.trim().is_empty() && !self.gh_token.trim().is_empty(),
+        }
+    }
+
+    /// Il posto dove sta la lista, se è un documento JSON (file o GitHub).
+    fn doc_backend(&self) -> Option<Box<dyn Backend + Send>> {
+        match self.mode {
+            Mode::File if !self.shared_path.trim().is_empty() => Some(Box::new(FileBackend {
+                path: PathBuf::from(self.shared_path.trim()),
+            })),
+            Mode::GitHub if self.configured() => Some(Box::new(GitHubBackend {
+                repo: self.gh_repo.clone(),
+                path: self.gh_file(),
+                token: self.gh_token.clone(),
+                sha: RefCell::new(None),
+            })),
+            _ => None,
+        }
+    }
+}
+
+fn history_path(col: &str) -> PathBuf {
+    data_dir().join(format!("storico-collezione-{col}.json"))
+}
+
+fn load_local_history(col: &str) -> Vec<HistoryEntry> {
+    std::fs::read_to_string(history_path(col))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_local_history(col: &str, h: &[HistoryEntry]) {
+    if let Ok(t) = serde_json::to_string_pretty(h) {
+        let _ = std::fs::write(history_path(col), t);
     }
 }
 
@@ -206,6 +471,29 @@ fn parse_ids(text: &str) -> Vec<String> {
     out
 }
 
+/// Vero se il percorso sembra dentro una cartella che si sincronizza da sola.
+fn looks_synced(path: &str) -> bool {
+    let p = path.to_lowercase();
+    [
+        "dropbox",
+        "google drive",
+        "googledrive",
+        "my drive",
+        "il mio drive",
+        "onedrive",
+        "sync",
+        "nextcloud",
+        "owncloud",
+        "mega",
+        "icloud",
+        "pcloud",
+        "insync",
+        "seafile",
+    ]
+    .iter()
+    .any(|k| p.contains(k))
+}
+
 /// Toglie i tag [b], [url=...], [h1]... dalle descrizioni del Workshop e accorcia il testo.
 fn clean_bbcode(s: &str) -> String {
     let mut out = String::new();
@@ -242,8 +530,88 @@ fn clean_bbcode(s: &str) -> String {
     }
 }
 
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(20))
+        .build()
+}
+
+fn num(v: &serde_json::Value) -> u64 {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------
-// Informazioni sugli oggetti (API web pubblica di Steam, senza chiave)
+// Steam: richieste al client (dipendenze, collezioni)
+// ---------------------------------------------------------------------
+
+/// Quello che il client Steam ci dice di un oggetto del Workshop.
+#[derive(Clone, Default)]
+struct UgcInfo {
+    id: String,
+    title: String,
+    is_collection: bool,
+    /// Per una collezione: i suoi oggetti. Per un addon: gli "Oggetti richiesti".
+    children: Vec<String>,
+}
+
+type UgcReply = Sender<Result<Vec<UgcInfo>, String>>;
+
+struct SteamReq {
+    ids: Vec<u64>,
+    reply: UgcReply,
+}
+
+/// Permette ai thread di lavoro di chiedere cose al client Steam, che vive
+/// nel thread dell'interfaccia (lì vengono eseguite le callback).
+#[derive(Clone)]
+struct SteamLink {
+    tx: Sender<SteamReq>,
+    ctx: egui::Context,
+}
+
+impl SteamLink {
+    fn query(&self, ids: &[String]) -> Result<BTreeMap<String, UgcInfo>, String> {
+        let nums: Vec<u64> = ids.iter().filter_map(|s| s.parse().ok()).collect();
+        let mut out = BTreeMap::new();
+        for chunk in nums.chunks(50) {
+            let (rtx, rrx) = channel();
+            self.tx
+                .send(SteamReq {
+                    ids: chunk.to_vec(),
+                    reply: rtx,
+                })
+                .map_err(|_| "Steam non disponibile".to_string())?;
+            self.ctx.request_repaint();
+            let r = rrx
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|_| "Steam non ha risposto in tempo".to_string())??;
+            for i in r {
+                out.insert(i.id.clone(), i);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Gli oggetti dentro una collezione (e il suo titolo).
+    fn collection(&self, col: &str) -> Result<(String, BTreeSet<String>), String> {
+        let info = self.query(&[col.to_string()])?;
+        match info.get(col) {
+            None => Err(
+                "collezione non trovata: controlla il link, che sia pubblicata e che tu possa vederla"
+                    .to_string(),
+            ),
+            Some(i) if !i.is_collection => {
+                Err("il link indicato è un addon, non una collezione".to_string())
+            }
+            Some(i) => Ok((i.title.clone(), i.children.iter().cloned().collect())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Informazioni sugli addon (API web pubblica di Steam + client Steam)
 // ---------------------------------------------------------------------
 
 #[derive(Clone, Default)]
@@ -257,7 +625,7 @@ struct Meta {
     banned: bool,
     size: u64,
     updated: u64,
-    /// Addon richiesti da questo addon (dipendenze)
+    /// Oggetti richiesti da questo addon
     deps: Vec<String>,
 }
 
@@ -287,58 +655,6 @@ impl Meta {
     }
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(15))
-        .build()
-}
-
-fn num(v: &serde_json::Value) -> u64 {
-    v.as_u64()
-        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        .unwrap_or(0)
-}
-
-/// Figli di ogni ID: per una collezione sono i suoi addon, per un addon
-/// normale sono gli addon che richiede. Ogni figlio è (id, tipo): tipo 0 = addon, 2 = collezione.
-fn fetch_children(ids: &[String]) -> Result<BTreeMap<String, Vec<(String, u64)>>, String> {
-    let agent = agent();
-    let mut out = BTreeMap::new();
-    for chunk in ids.chunks(100) {
-        let mut form: Vec<(String, String)> =
-            vec![("collectioncount".to_string(), chunk.len().to_string())];
-        for (i, id) in chunk.iter().enumerate() {
-            form.push((format!("publishedfileids[{i}]"), id.clone()));
-        }
-        let pairs: Vec<(&str, &str)> = form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-        let resp: serde_json::Value = agent
-            .post(&format!("{API}/GetCollectionDetails/v1/"))
-            .send_form(&pairs)
-            .map_err(|e| format!("rete: {e}"))?
-            .into_json()
-            .map_err(|e| format!("risposta non valida: {e}"))?;
-        if let Some(list) = resp["response"]["collectiondetails"].as_array() {
-            for d in list {
-                let id = d["publishedfileid"].as_str().unwrap_or("").to_string();
-                if id.is_empty() {
-                    continue;
-                }
-                let mut kids = Vec::new();
-                if let Some(ch) = d["children"].as_array() {
-                    for c in ch {
-                        let cid = c["publishedfileid"].as_str().unwrap_or("").to_string();
-                        if !cid.is_empty() && cid != id {
-                            kids.push((cid, num(&c["filetype"])));
-                        }
-                    }
-                }
-                out.insert(id, kids);
-            }
-        }
-    }
-    Ok(out)
-}
-
 fn fetch_meta(ids: &[String]) -> Result<BTreeMap<String, Meta>, String> {
     let agent = agent();
     let mut out = BTreeMap::new();
@@ -350,7 +666,7 @@ fn fetch_meta(ids: &[String]) -> Result<BTreeMap<String, Meta>, String> {
         }
         let pairs: Vec<(&str, &str)> = form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         let resp: serde_json::Value = agent
-            .post(&format!("{API}/GetPublishedFileDetails/v1/"))
+            .post(&format!("{STEAM_API}/GetPublishedFileDetails/v1/"))
             .send_form(&pairs)
             .map_err(|e| format!("rete: {e}"))?
             .into_json()
@@ -379,19 +695,153 @@ fn fetch_meta(ids: &[String]) -> Result<BTreeMap<String, Meta>, String> {
             }
         }
     }
-    // Le dipendenze sono un extra: se la richiesta fallisce, pazienza.
-    if let Ok(children) = fetch_children(ids) {
-        for (id, kids) in children {
-            if let Some(m) = out.get_mut(&id) {
-                m.deps = kids
-                    .into_iter()
-                    .filter(|(_, t)| *t == 0)
-                    .map(|(c, _)| c)
-                    .collect();
+    Ok(out)
+}
+
+/// Informazioni complete: dati dal web + oggetti richiesti dal client Steam.
+fn fetch_meta_full(link: &SteamLink, ids: &[String]) -> Result<BTreeMap<String, Meta>, String> {
+    let mut m = fetch_meta(ids)?;
+    if let Ok(info) = link.query(ids) {
+        for (id, i) in info {
+            if let Some(mm) = m.get_mut(&id) {
+                if !i.is_collection {
+                    mm.deps = i.children;
+                }
             }
         }
     }
-    Ok(out)
+    Ok(m)
+}
+
+/// Prepara una condivisione: apre le collezioni, aggiunge gli oggetti richiesti
+/// (anche indiretti) e scarta quello che non va. Gira in un thread di lavoro.
+fn prepare_share(link: &SteamLink, ids: Vec<String>, local: &BTreeSet<String>) -> Msg {
+    let mut logs: Vec<String> = Vec::new();
+    let mut items: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = ids.iter().cloned().collect();
+    let mut deps_of: Vec<(String, String)> = Vec::new(); // (richiesto, da chi)
+    let mut frontier = ids;
+    for _ in 0..8 {
+        if frontier.is_empty() {
+            break;
+        }
+        let info = match link.query(&frontier) {
+            Ok(i) => i,
+            Err(e) => {
+                logs.push(format!(
+                    "Non riesco a leggere da Steam gli oggetti richiesti ({e}): li salto"
+                ));
+                items.append(&mut frontier);
+                break;
+            }
+        };
+        let mut next = Vec::new();
+        for id in frontier.drain(..) {
+            match info.get(&id) {
+                Some(i) if i.is_collection => {
+                    logs.push(format!(
+                        "\"{}\" è una collezione: prendo i suoi {} oggetti",
+                        i.title,
+                        i.children.len()
+                    ));
+                    for c in &i.children {
+                        if seen.insert(c.clone()) {
+                            next.push(c.clone());
+                        }
+                    }
+                }
+                Some(i) => {
+                    for c in &i.children {
+                        if seen.insert(c.clone()) {
+                            next.push(c.clone());
+                            deps_of.push((c.clone(), id.clone()));
+                        }
+                    }
+                    items.push(id);
+                }
+                None => items.push(id),
+            }
+        }
+        frontier = next;
+    }
+    items.append(&mut frontier);
+
+    let metas = match fetch_meta(&items) {
+        Ok(m) => m,
+        Err(e) => {
+            logs.push(format!("Controllo degli addon non riuscito: {e}"));
+            BTreeMap::new()
+        }
+    };
+    let title = |id: &str| -> String {
+        metas
+            .get(id)
+            .map(|m| m.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| format!("Workshop {id}"))
+    };
+    for (d, parent) in &deps_of {
+        logs.push(format!(
+            "Oggetto richiesto aggiunto: {} (serve a {})",
+            title(d),
+            title(parent)
+        ));
+    }
+    let mut good = Vec::new();
+    for id in items {
+        match metas.get(&id) {
+            Some(m) if m.deleted() || m.wrong_app() => {
+                logs.push(format!("Scartato {}: {}", title(&id), m.warning()));
+            }
+            None if !local.contains(&id) => {
+                logs.push(format!("Scartato {id}: ID sconosciuto"));
+            }
+            _ => good.push(id),
+        }
+    }
+    Msg::ShareReady { good, metas, logs }
+}
+
+// ---------------------------------------------------------------------
+// Messaggi dai thread di lavoro
+// ---------------------------------------------------------------------
+
+enum Loaded {
+    Doc(Shared),
+    Collection(String, BTreeSet<String>),
+}
+
+enum Msg {
+    Loaded {
+        gen: u64,
+        result: Result<Loaded, String>,
+    },
+    Meta(Result<BTreeMap<String, Meta>, String>),
+    ShareReady {
+        good: Vec<String>,
+        metas: BTreeMap<String, Meta>,
+        logs: Vec<String>,
+    },
+    Saved {
+        gen: u64,
+        result: Result<Shared, String>,
+        ids: Vec<String>,
+        present: bool,
+        then: Vec<String>,
+    },
+    Verify {
+        gen: u64,
+        result: Result<(String, BTreeSet<String>), String>,
+        ids: Vec<String>,
+        present: bool,
+    },
+}
+
+/// Esito di una iscrizione/disiscrizione, che Steam comunica in modo asincrono.
+struct Done {
+    id: u64,
+    what: &'static str,
+    result: Result<(), String>,
 }
 
 // ---------------------------------------------------------------------
@@ -522,16 +972,20 @@ enum Action {
     CancelRemove,
     ToggleIgnore,
     AddIds,
-    ImportCollection,
-    BrowseFile,
-    NewFile,
+    OpenSettings(Mode),
+    SaveSettings,
 }
 
-/// Esito di una iscrizione/disiscrizione, che Steam comunica in modo asincrono.
-struct Done {
-    id: u64,
-    what: &'static str,
-    result: Result<(), String>,
+/// Bozza della finestra Impostazioni.
+#[derive(Clone)]
+struct Draft {
+    mode: Mode,
+    path: String,
+    collection: String,
+    gh_repo: String,
+    gh_path: String,
+    gh_token: String,
+    nick: String,
 }
 
 // ---------------------------------------------------------------------
@@ -543,12 +997,18 @@ struct App {
     client: Option<Client>,
     steam_error: String,
     cfg: Config,
-    nick_input: String,
+    gen: u64,
     shared: Shared,
     shared_error: String,
+    collection_title: String,
+    loaded_once: bool,
     local: Vec<u64>,
     meta: BTreeMap<String, Meta>,
-    meta_rx: Option<Receiver<Result<BTreeMap<String, Meta>, String>>>,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+    busy: usize,
+    link: SteamLink,
+    steam_req_rx: Receiver<SteamReq>,
     steam_tx: Sender<Done>,
     steam_rx: Receiver<Done>,
     pending: usize,
@@ -558,9 +1018,11 @@ struct App {
     filter: Filter,
     sort: SortBy,
     add_input: String,
+    want_plan: bool,
     plan: Option<Plan>,
     confirm_remove: Option<Vec<String>>,
     show_history: bool,
+    settings: Option<Draft>,
     log: Vec<String>,
 }
 
@@ -577,19 +1039,29 @@ impl App {
                 ),
             ),
         };
+        let (tx, rx) = channel();
+        let (req_tx, steam_req_rx) = channel();
         let (steam_tx, steam_rx) = channel();
-        let nick_input = cfg.nickname.clone();
         let mut app = App {
             ctx: cc.egui_ctx.clone(),
             client,
             steam_error,
             cfg,
-            nick_input,
+            gen: 0,
             shared: Shared::default(),
             shared_error: String::new(),
+            collection_title: String::new(),
+            loaded_once: false,
             local: Vec::new(),
             meta: BTreeMap::new(),
-            meta_rx: None,
+            tx,
+            rx,
+            busy: 0,
+            link: SteamLink {
+                tx: req_tx,
+                ctx: cc.egui_ctx.clone(),
+            },
+            steam_req_rx,
             steam_tx,
             steam_rx,
             pending: 0,
@@ -599,27 +1071,30 @@ impl App {
             filter: Filter::All,
             sort: SortBy::Status,
             add_input: String::new(),
+            want_plan: false,
             plan: None,
             confirm_remove: None,
             show_history: false,
+            settings: None,
             log: Vec::new(),
         };
-        app.reload_all();
+        app.reload_all(true);
         app
     }
 
-    // ----- dati -----
-
-    fn backend(&self) -> Option<FileBackend> {
-        let p = self.cfg.shared_path.trim();
-        if p.is_empty() {
-            None
-        } else {
-            Some(FileBackend {
-                path: PathBuf::from(p),
-            })
-        }
+    /// Esegue un lavoro in un thread e ne riceve il risultato come messaggio.
+    fn spawn(&mut self, f: impl FnOnce() -> Msg + Send + 'static) {
+        self.busy += 1;
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let m = f();
+            let _ = tx.send(m);
+            ctx.request_repaint();
+        });
     }
+
+    // ----- dati -----
 
     fn nick(&self) -> String {
         if self.cfg.nickname.trim().is_empty() {
@@ -642,10 +1117,10 @@ impl App {
             .collect()
     }
 
-    fn reload_all(&mut self) {
+    fn reload_all(&mut self, full_meta: bool) {
         self.refresh_local();
         self.reload_shared();
-        self.start_meta();
+        self.start_meta(full_meta);
     }
 
     fn refresh_local(&mut self) {
@@ -658,36 +1133,50 @@ impl App {
     }
 
     fn reload_shared(&mut self) {
-        match self.backend() {
-            None => {
-                self.shared = Shared::default();
-                self.shared_error.clear();
+        if !self.cfg.configured() {
+            self.shared = Shared::default();
+            self.shared_error.clear();
+            return;
+        }
+        let gen = self.gen;
+        match self.cfg.mode {
+            Mode::Steam => {
+                let link = self.link.clone();
+                let col = self.cfg.collection_id();
+                self.spawn(move || Msg::Loaded {
+                    gen,
+                    result: link
+                        .collection(&col)
+                        .map(|(t, set)| Loaded::Collection(t, set)),
+                });
             }
-            Some(b) => match b.load() {
-                Ok(s) => {
-                    self.shared = s;
-                    self.shared_error.clear();
-                }
-                Err(e) => self.shared_error = e,
-            },
+            _ => {
+                let cfg = self.cfg.clone();
+                self.spawn(move || {
+                    let result = match cfg.doc_backend() {
+                        Some(b) => b.load().map(Loaded::Doc),
+                        None => Err("impostazioni incomplete".to_string()),
+                    };
+                    Msg::Loaded { gen, result }
+                });
+            }
         }
     }
 
-    fn start_meta(&mut self) {
+    /// Scarica titoli, immagini, pesi e oggetti richiesti. Se full è falso,
+    /// solo per gli addon di cui non sappiamo ancora niente.
+    fn start_meta(&mut self, full: bool) {
         let mut ids = self.local_set();
         ids.extend(self.group_set());
-        let ids: Vec<String> = ids.into_iter().collect();
+        let ids: Vec<String> = ids
+            .into_iter()
+            .filter(|i| full || !self.meta.contains_key(i))
+            .collect();
         if ids.is_empty() {
             return;
         }
-        let (tx, rx) = channel();
-        let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
-            let r = fetch_meta(&ids);
-            let _ = tx.send(r);
-            ctx.request_repaint();
-        });
-        self.meta_rx = Some(rx);
+        let link = self.link.clone();
+        self.spawn(move || Msg::Meta(fetch_meta_full(&link, &ids)));
     }
 
     fn title_of(&self, id: &str) -> String {
@@ -729,15 +1218,15 @@ impl App {
             };
             let meta = self.meta.get(&id);
             let mut warn = meta.map(|m| m.warning()).unwrap_or_default();
-            if warn.is_empty() && group.contains(&id) {
+            if warn.is_empty() {
                 if let Some(m) = meta {
-                    let miss = m
+                    let miss: Vec<&String> = m
                         .deps
                         .iter()
                         .filter(|d| !group.contains(*d) && !local.contains(*d))
-                        .count();
-                    if miss > 0 {
-                        warn = format!("richiede {miss} addon che il gruppo non ha");
+                        .collect();
+                    if !miss.is_empty() {
+                        warn = format!("mancano {} oggetti richiesti", miss.len());
                     }
                 }
             }
@@ -806,6 +1295,47 @@ impl App {
         self.pending += 1;
     }
 
+    /// Risponde alle richieste dei thread di lavoro interrogando il client Steam.
+    fn serve_steam_requests(&mut self) {
+        while let Ok(req) = self.steam_req_rx.try_recv() {
+            let Some(c) = &self.client else {
+                let _ = req.reply.send(Err("Steam non collegato".to_string()));
+                continue;
+            };
+            let items: Vec<PublishedFileId> = req.ids.iter().map(|i| PublishedFileId(*i)).collect();
+            let q = match c.ugc().query_items(items) {
+                Ok(q) => q,
+                Err(e) => {
+                    let _ = req.reply.send(Err(format!("{e}")));
+                    continue;
+                }
+            };
+            let reply = req.reply;
+            q.include_children(true)
+                .allow_cached_response(0)
+                .fetch(move |r| {
+                    let res = match r {
+                        Ok(qr) => {
+                            let mut v = Vec::new();
+                            for i in 0..qr.returned_results() {
+                                let Some(info) = qr.get(i) else { continue };
+                                let kids = qr.get_children(i).unwrap_or_default();
+                                v.push(UgcInfo {
+                                    id: info.published_file_id.0.to_string(),
+                                    title: info.title.clone(),
+                                    is_collection: matches!(info.file_type, FileType::Collection),
+                                    children: kids.into_iter().map(|k| k.0.to_string()).collect(),
+                                });
+                            }
+                            Ok(v)
+                        }
+                        Err(e) => Err(format!("{e:?}")),
+                    };
+                    let _ = reply.send(res);
+                });
+        }
+    }
+
     fn backup(&mut self) {
         let text: Vec<String> = self.local.iter().map(|i| i.to_string()).collect();
         let path = data_dir().join(format!("backup-{}.txt", now()));
@@ -817,11 +1347,13 @@ impl App {
         }
     }
 
-    /// Riceve gli esiti di Steam e le informazioni scaricate.
+    // ----- ricezione messaggi -----
+
     fn pump(&mut self, ctx: &egui::Context) {
         if let Some(c) = &self.client {
             c.run_callbacks();
         }
+        self.serve_steam_requests();
 
         let mut finished = false;
         while let Ok(d) = self.steam_rx.try_recv() {
@@ -838,50 +1370,334 @@ impl App {
             self.refresh_local();
         }
 
-        let mut got = None;
-        if let Some(rx) = &self.meta_rx {
-            if let Ok(r) = rx.try_recv() {
-                got = Some(r);
-            }
+        while let Ok(m) = self.rx.try_recv() {
+            self.busy = self.busy.saturating_sub(1);
+            self.on_msg(m);
         }
-        if let Some(r) = got {
-            self.meta_rx = None;
-            match r {
+
+        // Le callback di Steam vanno lette spesso anche senza input dell'utente.
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
+    fn on_msg(&mut self, m: Msg) {
+        match m {
+            Msg::Loaded { gen, result } => {
+                if gen != self.gen {
+                    return;
+                }
+                match result {
+                    Ok(Loaded::Doc(s)) => {
+                        self.shared = s;
+                        self.shared_error.clear();
+                    }
+                    Ok(Loaded::Collection(title, set)) => {
+                        self.shared_error.clear();
+                        self.collection_title = title;
+                        self.on_collection(set);
+                    }
+                    Err(e) => {
+                        self.shared_error = e;
+                        self.want_plan = false;
+                        return;
+                    }
+                }
+                self.loaded_once = true;
+                self.start_meta(false);
+                if self.want_plan {
+                    self.want_plan = false;
+                    self.plan = Some(self.make_plan());
+                }
+            }
+            Msg::Meta(r) => match r {
                 Ok(m) => self.meta.extend(m),
                 Err(e) => self
                     .log
                     .push(format!("Informazioni sugli addon non scaricate: {e}")),
+            },
+            Msg::ShareReady { good, metas, logs } => {
+                self.meta.extend(metas);
+                self.log.extend(logs);
+                if good.is_empty() {
+                    self.log.push("Niente da condividere.".to_string());
+                    return;
+                }
+                let group = self.group_set();
+                let new: Vec<String> = good
+                    .iter()
+                    .filter(|i| !group.contains(*i))
+                    .cloned()
+                    .collect();
+                if new.is_empty() {
+                    self.log
+                        .push("Erano già tutti nella lista del gruppo.".to_string());
+                    self.after_change(&good, true);
+                } else {
+                    self.publish(new, true, good);
+                }
             }
-        }
-
-        if self.pending > 0 || self.meta_rx.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(200));
+            Msg::Saved {
+                gen,
+                result,
+                ids,
+                present,
+                then,
+            } => match result {
+                Ok(s) => {
+                    if gen == self.gen {
+                        self.shared = s;
+                    }
+                    self.log_change(ids.len(), present);
+                    self.after_change(&then, present);
+                }
+                Err(e) => self
+                    .log
+                    .push(format!("✖ Lista del gruppo non aggiornata: {e}")),
+            },
+            Msg::Verify {
+                gen,
+                result,
+                ids,
+                present,
+            } => {
+                if gen != self.gen {
+                    return;
+                }
+                match result {
+                    Ok((title, set)) => {
+                        let wrong: Vec<String> = ids
+                            .iter()
+                            .filter(|i| set.contains(*i) != present)
+                            .map(|i| self.title_of(i))
+                            .collect();
+                        if wrong.is_empty() {
+                            self.log.push(format!(
+                                "✔ Steam ha confermato {} modifiche alla collezione",
+                                ids.len()
+                            ));
+                        } else {
+                            self.log.push(format!(
+                                "✖ Steam non mostra ancora la modifica per: {}. Premi Aggiorna tra poco; se resta così, controlla di essere collaboratore della collezione e che sia pubblicata.",
+                                wrong.join(", ")
+                            ));
+                        }
+                        self.collection_title = title;
+                        self.on_collection(set);
+                    }
+                    Err(e) => self
+                        .log
+                        .push(format!("Non riesco a ricontrollare la collezione: {e}")),
+                }
+            }
         }
     }
 
-    // ----- file del gruppo -----
-
-    fn publish(&mut self, ids: &[String], present: bool) -> bool {
-        let Some(b) = self.backend() else {
-            self.log
-                .push("Scegli prima il file del gruppo.".to_string());
-            return false;
-        };
-        let by = self.nick();
-        let items: Vec<(String, String)> =
-            ids.iter().map(|i| (i.clone(), self.title_of(i))).collect();
-        let res = mutate(&b, |s| {
-            let t = now();
-            for (id, title) in items {
-                s.history.push(HistoryEntry {
+    /// Nuovo contenuto della collezione Steam: lo trasforma nella lista del gruppo,
+    /// ricordando cosa c'era prima per capire cosa è stato tolto.
+    fn on_collection(&mut self, present: BTreeSet<String>) {
+        let col = self.cfg.collection_id();
+        let first = self.cfg.col_state_for != col;
+        if first {
+            self.cfg.col_state_for = col.clone();
+            self.cfg.col_seen.clear();
+            self.cfg.col_present.clear();
+        }
+        // Protezione: se Steam risponde con una collezione vuota mentre prima
+        // aveva oggetti, è quasi certamente un errore di lettura. Non la usiamo,
+        // altrimenti tutto risulterebbe "tolto dal gruppo".
+        if !first && present.is_empty() && self.cfg.col_present.len() > 1 {
+            self.shared_error = "Steam ha restituito la collezione vuota: la ignoro e tengo l'ultima lista buona. Premi Aggiorna tra poco.".to_string();
+            return;
+        }
+        let mut history = load_local_history(&col);
+        let t = now();
+        if !first {
+            let prev = self.cfg.col_present.clone();
+            for id in present.difference(&prev) {
+                history.push(HistoryEntry {
                     ts: t,
-                    by: by.clone(),
-                    added: present,
+                    by: "qualcuno".to_string(),
+                    added: true,
                     id: id.clone(),
-                    title: title.clone(),
+                    title: self.title_of(id),
                 });
-                s.items.insert(
-                    id,
+            }
+            for id in prev.difference(&present) {
+                history.push(HistoryEntry {
+                    ts: t,
+                    by: "qualcuno".to_string(),
+                    added: false,
+                    id: id.clone(),
+                    title: self.title_of(id),
+                });
+            }
+            if history.len() > HISTORY_MAX {
+                let extra = history.len() - HISTORY_MAX;
+                history.drain(0..extra);
+            }
+            save_local_history(&col, &history);
+        }
+        self.cfg.col_seen.extend(present.iter().cloned());
+        self.cfg.col_present = present.clone();
+        self.cfg.save();
+
+        let mut items = BTreeMap::new();
+        for id in &self.cfg.col_seen {
+            let last = history.iter().rev().find(|h| &h.id == id);
+            items.insert(
+                id.clone(),
+                Entry {
+                    present: present.contains(id),
+                    title: self.title_of(id),
+                    by: last.map(|h| h.by.clone()).unwrap_or_default(),
+                    ts: last.map(|h| h.ts).unwrap_or(0),
+                },
+            );
+        }
+        self.shared = Shared { items, history };
+    }
+
+    fn log_change(&mut self, n: usize, present: bool) {
+        if present {
+            self.log
+                .push(format!("✔ Aggiunti alla lista del gruppo: {n}"));
+        } else {
+            self.log
+                .push(format!("✔ Tolti dalla lista del gruppo: {n}"));
+        }
+    }
+
+    /// Dopo che la lista del gruppo è cambiata: allinea le tue iscrizioni.
+    fn after_change(&mut self, ids: &[String], present: bool) {
+        let local = self.local_set();
+        for id in ids {
+            self.cfg.ignored.remove(id);
+            if present && !local.contains(id) {
+                self.subscribe(id);
+            }
+            if !present && local.contains(id) {
+                self.unsubscribe(id);
+            }
+        }
+        self.cfg.save();
+    }
+
+    // ----- modifica della lista del gruppo -----
+
+    /// Aggiunge (present = true) o toglie gli addon dalla lista del gruppo;
+    /// se va a buon fine, poi allinea le tue iscrizioni per gli ID in `then`.
+    fn publish(&mut self, ids: Vec<String>, present: bool, then: Vec<String>) {
+        if !self.cfg.configured() {
+            self.log
+                .push("Prima scegli dove tenere la lista del gruppo (Impostazioni).".to_string());
+            return;
+        }
+        let by = self.nick();
+        match self.cfg.mode {
+            Mode::Steam => self.publish_collection(ids, present, then, by),
+            _ => {
+                let cfg = self.cfg.clone();
+                let gen = self.gen;
+                let items: Vec<(String, String)> =
+                    ids.iter().map(|i| (i.clone(), self.title_of(i))).collect();
+                self.spawn(move || {
+                    let result = match cfg.doc_backend() {
+                        Some(b) => mutate(b.as_ref(), |s| {
+                            let t = now();
+                            for (id, title) in &items {
+                                s.history.push(HistoryEntry {
+                                    ts: t,
+                                    by: by.clone(),
+                                    added: present,
+                                    id: id.clone(),
+                                    title: title.clone(),
+                                });
+                                s.items.insert(
+                                    id.clone(),
+                                    Entry {
+                                        present,
+                                        title: title.clone(),
+                                        by: by.clone(),
+                                        ts: t,
+                                    },
+                                );
+                            }
+                            if s.history.len() > HISTORY_MAX {
+                                let extra = s.history.len() - HISTORY_MAX;
+                                s.history.drain(0..extra);
+                            }
+                        }),
+                        None => Err("impostazioni incomplete".to_string()),
+                    };
+                    Msg::Saved {
+                        gen,
+                        result,
+                        ids,
+                        present,
+                        then,
+                    }
+                });
+            }
+        }
+    }
+
+    /// Collezione Steam: chiede a Steam di aggiungere/togliere gli oggetti,
+    /// poi dopo qualche secondo ricontrolla che sia successo davvero.
+    fn publish_collection(
+        &mut self,
+        ids: Vec<String>,
+        present: bool,
+        then: Vec<String>,
+        by: String,
+    ) {
+        let Ok(col) = self.cfg.collection_id().parse::<u64>() else {
+            self.log
+                .push("Link della collezione non valido.".to_string());
+            return;
+        };
+        if self.client.is_none() {
+            self.log
+                .push("Steam non è collegato: non posso modificare la collezione.".to_string());
+            return;
+        }
+        unsafe {
+            let ugc = steamworks::sys::SteamAPI_SteamUGC_v021();
+            for id in &ids {
+                if let Ok(n) = id.parse::<u64>() {
+                    if present {
+                        steamworks::sys::SteamAPI_ISteamUGC_AddDependency(ugc, col, n);
+                    } else {
+                        steamworks::sys::SteamAPI_ISteamUGC_RemoveDependency(ugc, col, n);
+                    }
+                }
+            }
+        }
+        // Lo storico lo scriviamo subito con il tuo nome, così il controllo
+        // successivo non lo attribuisce a "qualcuno".
+        let col_s = col.to_string();
+        let mut history = load_local_history(&col_s);
+        let t = now();
+        for id in &ids {
+            history.push(HistoryEntry {
+                ts: t,
+                by: by.clone(),
+                added: present,
+                id: id.clone(),
+                title: self.title_of(id),
+            });
+            if present {
+                self.cfg.col_present.insert(id.clone());
+                self.cfg.col_seen.insert(id.clone());
+            } else {
+                self.cfg.col_present.remove(id);
+            }
+            let title = self.title_of(id);
+            if let Some(e) = self.shared.items.get_mut(id) {
+                e.present = present;
+                e.by = by.clone();
+                e.ts = t;
+            } else {
+                self.shared.items.insert(
+                    id.clone(),
                     Entry {
                         present,
                         title,
@@ -890,183 +1706,41 @@ impl App {
                     },
                 );
             }
-            if s.history.len() > HISTORY_MAX {
-                let extra = s.history.len() - HISTORY_MAX;
-                s.history.drain(0..extra);
+        }
+        save_local_history(&col_s, &history);
+        self.shared.history = history;
+        self.cfg.save();
+        self.log.push(format!(
+            "Chiesto a Steam di {} {} oggetti nella collezione, ricontrollo tra poco...",
+            if present { "aggiungere" } else { "togliere" },
+            ids.len()
+        ));
+        self.after_change(&then, present);
+
+        let link = self.link.clone();
+        let gen = self.gen;
+        self.spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            Msg::Verify {
+                gen,
+                result: link.collection(&col_s),
+                ids,
+                present,
             }
         });
-        match res {
-            Ok(s) => {
-                self.shared = s;
-                true
-            }
-            Err(e) => {
-                self.log
-                    .push(format!("Salvataggio nel file del gruppo fallito: {e}"));
-                false
-            }
-        }
     }
 
-    /// Aggiunge alla lista le dipendenze (anche indirette) degli addon dati.
-    fn expand_deps(&mut self, ids: Vec<String>) -> Vec<String> {
-        let mut all = ids.clone();
-        let mut seen: BTreeSet<String> = ids.iter().cloned().collect();
-        let mut frontier = ids;
-        let mut added: Vec<(String, String)> = Vec::new(); // (dipendenza, richiesta da)
-        for _ in 0..5 {
-            let unknown: Vec<String> = frontier
-                .iter()
-                .filter(|i| !self.meta.contains_key(*i))
-                .cloned()
-                .collect();
-            if !unknown.is_empty() {
-                match fetch_meta(&unknown) {
-                    Ok(m) => self.meta.extend(m),
-                    Err(e) => self.log.push(format!("Controllo addon non riuscito: {e}")),
-                }
-            }
-            let mut next = Vec::new();
-            for id in &frontier {
-                let deps = self
-                    .meta
-                    .get(id)
-                    .map(|m| m.deps.clone())
-                    .unwrap_or_default();
-                for d in deps {
-                    if seen.insert(d.clone()) {
-                        next.push(d.clone());
-                        all.push(d.clone());
-                        added.push((d, id.clone()));
-                    }
-                }
-            }
-            if next.is_empty() {
-                break;
-            }
-            frontier = next;
-        }
-        let unknown: Vec<String> = all
-            .iter()
-            .filter(|i| !self.meta.contains_key(*i))
-            .cloned()
-            .collect();
-        if !unknown.is_empty() {
-            if let Ok(m) = fetch_meta(&unknown) {
-                self.meta.extend(m);
-            }
-        }
-        for (d, parent) in added {
-            let line = format!(
-                "Aggiunta dipendenza: {} (serve a {})",
-                self.title_of(&d),
-                self.title_of(&parent)
-            );
-            self.log.push(line);
-        }
-        all
-    }
-
-    /// Condivide gli addon con il gruppo (con le loro dipendenze) e li iscrive qui.
-    fn share(&mut self, ids: Vec<String>) {
-        if self.backend().is_none() {
+    fn start_share(&mut self, ids: Vec<String>) {
+        if !self.cfg.configured() {
             self.log
-                .push("Scegli prima il file del gruppo.".to_string());
-            return;
-        }
-        let local = self.local_set();
-        let all = self.expand_deps(ids);
-        let mut good: Vec<String> = Vec::new();
-        for id in all {
-            match self.meta.get(&id) {
-                Some(m) if m.deleted() || m.wrong_app() => {
-                    let line = format!("Scartato {}: {}", self.title_of(&id), m.warning());
-                    self.log.push(line);
-                }
-                None if !local.contains(&id) => {
-                    self.log.push(format!("Scartato {id}: ID sconosciuto"));
-                }
-                _ => good.push(id),
-            }
-        }
-        if good.is_empty() {
-            return;
-        }
-        if self.publish(&good, true) {
-            for id in &good {
-                self.cfg.ignored.remove(id);
-                if !local.contains(id) {
-                    self.subscribe(id);
-                }
-            }
-            self.cfg.save();
-            self.log.push(format!(
-                "Condivisi con il gruppo: {} addon ({})",
-                good.len(),
-                human_size(good.iter().map(|i| self.size_of(i)).sum())
-            ));
-        }
-    }
-
-    fn import_collection(&mut self) {
-        let ids = parse_ids(&self.add_input);
-        if ids.is_empty() {
-            self.log
-                .push("Incolla il link o l'ID della collezione.".to_string());
-            return;
-        }
-        let mut items: Vec<String> = Vec::new();
-        let mut cols = ids;
-        for _ in 0..3 {
-            let children = match fetch_children(&cols) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.log
-                        .push(format!("Lettura della collezione non riuscita: {e}"));
-                    return;
-                }
-            };
-            let mut sub = Vec::new();
-            for (_, kids) in children {
-                for (cid, kind) in kids {
-                    if kind == 2 {
-                        sub.push(cid);
-                    } else if !items.contains(&cid) {
-                        items.push(cid);
-                    }
-                }
-            }
-            if sub.is_empty() {
-                break;
-            }
-            cols = sub;
-        }
-        if items.is_empty() {
-            self.log
-                .push("Nessun addon trovato: il link è di una collezione pubblica?".to_string());
+                .push("Prima scegli dove tenere la lista del gruppo (Impostazioni).".to_string());
             return;
         }
         self.log
-            .push(format!("Collezione letta: {} addon", items.len()));
-        self.share(items);
-        self.add_input.clear();
-    }
-
-    fn set_path(&mut self, p: PathBuf) {
-        self.cfg.shared_path = p.display().to_string();
-        self.cfg.save();
-        let b = FileBackend { path: p };
-        if !b.path.exists() {
-            match b.save(&Shared::default()) {
-                Ok(()) => self
-                    .log
-                    .push(format!("Creato il file del gruppo: {}", b.path.display())),
-                Err(e) => self
-                    .log
-                    .push(format!("Non riesco a creare il file del gruppo: {e}")),
-            }
-        }
-        self.reload_all();
+            .push("Controllo gli addon e gli oggetti richiesti...".to_string());
+        let link = self.link.clone();
+        let local = self.local_set();
+        self.spawn(move || prepare_share(&link, ids, &local));
     }
 
     // ----- azioni -----
@@ -1074,12 +1748,12 @@ impl App {
     fn run(&mut self, a: Action) {
         match a {
             Action::Refresh => {
-                self.reload_all();
-                self.log.push("Lista aggiornata.".to_string());
+                self.reload_all(true);
+                self.log.push("Aggiorno la lista...".to_string());
             }
             Action::Sync => {
-                self.reload_all();
-                self.plan = Some(self.make_plan());
+                self.want_plan = true;
+                self.reload_all(false);
             }
             Action::ApplyPlan => {
                 if let Some(plan) = self.plan.take() {
@@ -1100,7 +1774,7 @@ impl App {
             Action::ShareSelected => {
                 let ids: Vec<String> = self.selected.iter().cloned().collect();
                 if !ids.is_empty() {
-                    self.share(ids);
+                    self.start_share(ids);
                     self.selected.clear();
                 }
             }
@@ -1113,20 +1787,9 @@ impl App {
             Action::CancelRemove => self.confirm_remove = None,
             Action::ConfirmRemove => {
                 if let Some(ids) = self.confirm_remove.take() {
-                    if self.publish(&ids, false) {
-                        self.backup();
-                        let local = self.local_set();
-                        for id in &ids {
-                            self.cfg.ignored.remove(id);
-                            if local.contains(id) {
-                                self.unsubscribe(id);
-                            }
-                        }
-                        self.cfg.save();
-                        self.log
-                            .push(format!("Tolti a tutto il gruppo: {}", ids.len()));
-                        self.selected.clear();
-                    }
+                    self.backup();
+                    self.publish(ids.clone(), false, ids);
+                    self.selected.clear();
                 }
             }
             Action::ToggleIgnore => {
@@ -1147,40 +1810,87 @@ impl App {
                     self.log
                         .push("Non trovo nessun link o ID valido nel campo.".to_string());
                 } else {
-                    self.share(ids);
+                    self.start_share(ids);
                     self.add_input.clear();
                 }
             }
-            Action::ImportCollection => self.import_collection(),
-            Action::BrowseFile => {
-                let mut dlg = rfd::FileDialog::new()
-                    .set_title("Scegli il file del gruppo")
-                    .add_filter("File JSON", &["json"]);
-                if let Some(h) = dirs::home_dir() {
-                    dlg = dlg.set_directory(h);
-                }
-                if let Some(p) = dlg.pick_file() {
-                    self.set_path(p);
-                }
+            Action::OpenSettings(mode) => {
+                self.settings = Some(Draft {
+                    mode,
+                    path: self.cfg.shared_path.clone(),
+                    collection: self.cfg.collection.clone(),
+                    gh_repo: self.cfg.gh_repo.clone(),
+                    gh_path: self.cfg.gh_file(),
+                    gh_token: self.cfg.gh_token.clone(),
+                    nick: self.cfg.nickname.clone(),
+                });
             }
-            Action::NewFile => {
-                let mut dlg = rfd::FileDialog::new()
-                    .set_title("Dove salvo il file del gruppo? (meglio in una cartella condivisa)")
-                    .set_file_name("gmod-workshop-sync.json")
-                    .add_filter("File JSON", &["json"]);
-                if let Some(h) = dirs::home_dir() {
-                    dlg = dlg.set_directory(h);
+            Action::SaveSettings => {
+                let Some(d) = self.settings.take() else {
+                    return;
+                };
+                self.cfg.mode = d.mode;
+                self.cfg.shared_path = d.path.trim().to_string();
+                self.cfg.collection = d.collection.trim().to_string();
+                self.cfg.gh_repo = d.gh_repo.trim().to_string();
+                self.cfg.gh_path = d.gh_path.trim().to_string();
+                self.cfg.gh_token = d.gh_token.trim().to_string();
+                self.cfg.nickname = d.nick.trim().to_string();
+                self.cfg.save();
+                if self.cfg.mode == Mode::File && !self.cfg.shared_path.is_empty() {
+                    let b = FileBackend {
+                        path: PathBuf::from(&self.cfg.shared_path),
+                    };
+                    if !b.path.exists() {
+                        match b.save(&Shared::default()) {
+                            Ok(()) => self
+                                .log
+                                .push(format!("Creato il file del gruppo: {}", b.path.display())),
+                            Err(e) => self
+                                .log
+                                .push(format!("Non riesco a creare il file del gruppo: {e}")),
+                        }
+                    }
                 }
-                if let Some(p) = dlg.save_file() {
-                    self.set_path(p);
-                }
+                self.gen += 1;
+                self.shared = Shared::default();
+                self.collection_title.clear();
+                self.loaded_once = false;
+                self.reload_all(false);
             }
         }
     }
 
     // ----- disegno -----
 
-    /// Riga in alto: stato di Steam, file del gruppo, nome.
+    fn place_text(&self) -> (String, String) {
+        match self.cfg.mode {
+            Mode::Steam => {
+                let t = if self.collection_title.is_empty() {
+                    self.cfg.collection_id()
+                } else {
+                    self.collection_title.clone()
+                };
+                (
+                    format!("collezione Steam «{t}»"),
+                    self.cfg.collection.clone(),
+                )
+            }
+            Mode::File => {
+                let p = PathBuf::from(&self.cfg.shared_path);
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (format!("file {name}"), self.cfg.shared_path.clone())
+            }
+            Mode::GitHub => (
+                format!("GitHub {}", self.cfg.gh_repo),
+                format!("{} / {}", self.cfg.gh_repo, self.cfg.gh_file()),
+            ),
+        }
+    }
+
     fn header_panel(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -1191,49 +1901,70 @@ impl App {
                     ui.label(RichText::new("✖ Steam non collegato").color(RED))
                         .on_hover_text(self.steam_error.as_str());
                 }
-                ui.separator();
-                if let Some(b) = self.backend() {
-                    let name = b
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    ui.label("File del gruppo:");
-                    ui.label(RichText::new(name).strong())
-                        .on_hover_text(b.path.display().to_string());
-                    if ui
-                        .small_button("Cambia…")
-                        .on_hover_text("Scegli un altro file del gruppo")
-                        .clicked()
-                    {
-                        actions.push(Action::BrowseFile);
+                if self.cfg.configured() {
+                    ui.separator();
+                    let (short, full) = self.place_text();
+                    ui.label("Lista del gruppo:");
+                    ui.label(RichText::new(short).strong()).on_hover_text(full);
+                    if self.cfg.mode == Mode::Steam {
+                        ui.hyperlink_to(
+                            "apri",
+                            format!(
+                                "https://steamcommunity.com/sharedfiles/filedetails/?id={}",
+                                self.cfg.collection_id()
+                            ),
+                        );
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut self.nick_input)
-                            .desired_width(120.0)
-                            .hint_text(default_nick()),
-                    );
-                    if r.lost_focus() && self.nick_input.trim() != self.cfg.nickname {
-                        self.cfg.nickname = self.nick_input.trim().to_string();
-                        self.cfg.save();
+                    if ui
+                        .button("Impostazioni")
+                        .on_hover_text("Dove sta la lista del gruppo e il tuo nome")
+                        .clicked()
+                    {
+                        actions.push(Action::OpenSettings(self.cfg.mode));
                     }
-                    ui.label("Il tuo nome:")
-                        .on_hover_text("Compare nello storico accanto alle tue modifiche");
+                    if self.busy > 0 || self.pending > 0 {
+                        ui.spinner();
+                        ui.label(RichText::new("sto lavorando...").weak());
+                    }
                 });
             });
             if self.client.is_none() {
                 ui.label(RichText::new(self.steam_error.as_str()).color(RED).small());
             }
             if !self.shared_error.is_empty() {
-                ui.label(RichText::new(self.shared_error.as_str()).color(ORANGE));
+                ui.label(
+                    RichText::new(format!("⚠ Lista del gruppo non leggibile: {}", self.shared_error))
+                        .color(ORANGE),
+                );
+            }
+            if self.cfg.configured() {
+                if self.cfg.mode == Mode::File && !looks_synced(&self.cfg.shared_path) {
+                    ui.label(
+                        RichText::new("⚠ Il file non sembra in una cartella che si sincronizza (Dropbox, Drive, Syncthing...): se è solo sul tuo PC gli altri non vedranno le modifiche.")
+                            .color(ORANGE)
+                            .small(),
+                    );
+                }
+                if let Some(h) = self.shared.history.last() {
+                    ui.label(
+                        RichText::new(format!(
+                            "Ultima modifica del gruppo: {} {} ha {} «{}»",
+                            ago(h.ts),
+                            h.by,
+                            if h.added { "aggiunto" } else { "tolto" },
+                            h.title
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
             }
             ui.add_space(4.0);
         });
     }
 
-    /// Strumenti: sincronizza, aggiungi, filtri, azioni sulle spunte.
     fn toolbar_panel(&mut self, ctx: &egui::Context, rows: &[Row], actions: &mut Vec<Action>) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -1249,14 +1980,14 @@ impl App {
                 };
                 if ui
                     .add(egui::Button::new(RichText::new(label).strong()))
-                    .on_hover_text("Ti mostra cosa verrebbe aggiunto o tolto alle tue iscrizioni; applichi solo se confermi")
+                    .on_hover_text("Rilegge la lista del gruppo e ti mostra cosa verrebbe aggiunto o tolto alle tue iscrizioni; applichi solo se confermi")
                     .clicked()
                 {
                     actions.push(Action::Sync);
                 }
                 if ui
                     .button("Aggiorna")
-                    .on_hover_text("Rilegge le tue iscrizioni da Steam e il file del gruppo")
+                    .on_hover_text("Rilegge le tue iscrizioni da Steam e la lista del gruppo")
                     .clicked()
                 {
                     actions.push(Action::Refresh);
@@ -1270,38 +2001,33 @@ impl App {
                 }
                 ui.separator();
                 ui.label(format!(
-                    "Tue iscrizioni: {}   ·   Addon del gruppo: {} ({})",
+                    "Tue iscrizioni: {}   ·   Addon del gruppo: {}{}",
                     self.local.len(),
                     group.len(),
                     if group_size > 0 {
-                        human_size(group_size)
+                        format!(" ({})", human_size(group_size))
                     } else {
-                        "peso sconosciuto".to_string()
+                        String::new()
                     }
                 ));
             });
 
             ui.horizontal(|ui| {
                 ui.label("Nuovo addon o collezione:");
-                ui.add(
+                let r = ui.add(
                     egui::TextEdit::singleline(&mut self.add_input)
-                        .desired_width(300.0)
+                        .desired_width(320.0)
                         .hint_text("incolla il link o l'ID del Workshop"),
                 );
                 let has = !self.add_input.trim().is_empty();
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ui
                     .add_enabled(has, egui::Button::new("Aggiungi per tutti"))
-                    .on_hover_text("Lo dà a tutto il gruppo (con gli addon che richiede) e te lo iscrive subito")
+                    .on_hover_text("Lo mette nella lista del gruppo insieme agli oggetti che richiede e te lo iscrive. Se è una collezione, aggiunge tutti i suoi addon")
                     .clicked()
+                    || (has && enter)
                 {
                     actions.push(Action::AddIds);
-                }
-                if ui
-                    .add_enabled(has, egui::Button::new("Importa collezione"))
-                    .on_hover_text("Il link è di una collezione: dà a tutto il gruppo tutti i suoi addon")
-                    .clicked()
-                {
-                    actions.push(Action::ImportCollection);
                 }
             });
 
@@ -1344,17 +2070,17 @@ impl App {
                 } else {
                     let n = self.selected.len();
                     let size: u64 = self.selected.iter().map(|id| self.size_of(id)).sum();
-                    ui.label(RichText::new(format!("{n} spuntati ({})", human_size(size))).strong());
+                    ui.label(RichText::new(format!("{n} spuntati {}", human_size(size))).strong());
                     if ui
                         .button("Condividi con il gruppo")
-                        .on_hover_text("Li dà a tutti (con gli addon che richiedono)")
+                        .on_hover_text("Li mette nella lista del gruppo, con gli oggetti che richiedono")
                         .clicked()
                     {
                         actions.push(Action::ShareSelected);
                     }
                     if ui
                         .button(RichText::new("Togli a tutto il gruppo").color(RED))
-                        .on_hover_text("Chi sincronizza li perderà dalle sue iscrizioni. Chiede conferma")
+                        .on_hover_text("Li toglie dalla lista del gruppo: chi sincronizza li perderà. Chiede conferma")
                         .clicked()
                     {
                         actions.push(Action::AskRemove);
@@ -1385,7 +2111,7 @@ impl App {
         egui::TopBottomPanel::bottom("log")
             .resizable(true)
             .min_height(50.0)
-            .default_height(70.0)
+            .default_height(80.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
@@ -1414,18 +2140,12 @@ impl App {
         let entry = self.shared.items.get(&id).cloned();
         let local = self.local_set();
         let group = self.group_set();
-        let deps: Vec<(String, String, bool)> = meta
+        let deps: Vec<(String, bool)> = meta
             .as_ref()
             .map(|m| {
                 m.deps
                     .iter()
-                    .map(|d| {
-                        (
-                            d.clone(),
-                            self.title_of(d),
-                            local.contains(d) || group.contains(d),
-                        )
-                    })
+                    .map(|d| (self.title_of(d), local.contains(d) || group.contains(d)))
                     .collect()
             })
             .unwrap_or_default();
@@ -1478,17 +2198,19 @@ impl App {
                             ui.label(info.join("   ·   "));
                         }
                         if let Some(e) = &entry {
-                            let what = if e.present { "Condiviso" } else { "Tolto" };
-                            ui.label(format!("{what} da {} {}", e.by, ago(e.ts)));
+                            if !e.by.is_empty() {
+                                let what = if e.present { "Aggiunto" } else { "Tolto" };
+                                ui.label(format!("{what} da {} {}", e.by, ago(e.ts)));
+                            }
                         }
                         if !deps.is_empty() {
                             ui.add_space(4.0);
-                            ui.strong(format!("Richiede {} addon:", deps.len()));
-                            for (_, t, ok) in &deps {
+                            ui.strong(format!("Oggetti richiesti ({}):", deps.len()));
+                            for (t, ok) in &deps {
                                 if *ok {
-                                    ui.label(format!("• {t}"));
+                                    ui.label(format!("✔ {t}"));
                                 } else {
-                                    ui.label(RichText::new(format!("• {t} (manca)")).color(ORANGE));
+                                    ui.label(RichText::new(format!("✖ {t} (manca)")).color(ORANGE));
                                 }
                             }
                         }
@@ -1508,37 +2230,43 @@ impl App {
             });
     }
 
-    /// Prima volta: niente file del gruppo, spieghiamo cosa fare.
+    /// Prima volta: bisogna scegliere dove tenere la lista del gruppo.
     fn welcome_panel(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(30.0);
+            ui.add_space(24.0);
             ui.vertical_centered(|ui| {
-                ui.heading("Per iniziare serve il file del gruppo");
-                ui.add_space(8.0);
-                ui.label("È un piccolo file dove il programma scrive quali addon deve avere il gruppo.");
-                ui.label("Mettilo in una cartella che già condividete (Dropbox, Google Drive, Syncthing...).");
+                ui.heading("Dove tenete la lista degli addon del gruppo?");
+                ui.add_space(6.0);
+                ui.label("Tutti nel gruppo devono scegliere lo stesso posto. Si può cambiare dopo da Impostazioni.");
                 ui.add_space(16.0);
-                let big = egui::vec2(380.0, 36.0);
-                if ui
-                    .add(egui::Button::new("Sono il primo del gruppo: crea il file").min_size(big))
-                    .clicked()
-                {
-                    actions.push(Action::NewFile);
+                let big = egui::vec2(420.0, 34.0);
+                for (mode, desc) in [
+                    (
+                        Mode::Steam,
+                        "Una collezione del Workshop: Steam la tiene aggiornata per tutti, niente da installare.",
+                    ),
+                    (
+                        Mode::File,
+                        "Un file in una cartella che già condividete (Dropbox, Google Drive, Syncthing...).",
+                    ),
+                    (
+                        Mode::GitHub,
+                        "Un file in un repository GitHub: serve un account GitHub e un token per ognuno.",
+                    ),
+                ] {
+                    if ui
+                        .add(egui::Button::new(RichText::new(mode.label()).strong()).min_size(big))
+                        .clicked()
+                    {
+                        actions.push(Action::OpenSettings(mode));
+                    }
+                    ui.label(RichText::new(desc).weak());
+                    ui.add_space(10.0);
                 }
                 ui.add_space(8.0);
-                if ui
-                    .add(egui::Button::new("Un amico l'ha già creato: sceglilo").min_size(big))
-                    .clicked()
-                {
-                    actions.push(Action::BrowseFile);
-                }
-                ui.add_space(16.0);
                 ui.label(
-                    RichText::new(format!(
-                        "Intanto vedo {} tue iscrizioni su Steam.",
-                        self.local.len()
-                    ))
-                    .weak(),
+                    RichText::new(format!("Intanto vedo {} tue iscrizioni su Steam.", self.local.len()))
+                        .weak(),
                 );
             });
         });
@@ -1546,6 +2274,14 @@ impl App {
 
     fn list_panel(&mut self, ctx: &egui::Context, rows: &[Row]) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            if !self.loaded_once && self.shared_error.is_empty() {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Leggo la lista del gruppo...");
+                });
+                return;
+            }
             let q = self.search.to_lowercase();
             let filter = self.filter;
             let visible: Vec<&Row> = rows
@@ -1580,7 +2316,7 @@ impl App {
                 .column(Column::exact(115.0))
                 .column(Column::remainder().at_least(120.0).clip(true))
                 .column(Column::exact(70.0))
-                .column(Column::initial(190.0).at_least(60.0).clip(true))
+                .column(Column::initial(200.0).at_least(60.0).clip(true))
                 .header(22.0, |mut h| {
                     h.col(|ui| {
                         let mut v = all_sel;
@@ -1652,6 +2388,141 @@ impl App {
         });
     }
 
+    fn settings_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some(d) = self.settings.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        egui::Window::new("Impostazioni")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.strong("Dove sta la lista del gruppo");
+                ui.horizontal(|ui| {
+                    for m in [Mode::Steam, Mode::File, Mode::GitHub] {
+                        ui.selectable_value(&mut d.mode, m, m.label());
+                    }
+                });
+                ui.add_space(6.0);
+                match d.mode {
+                    Mode::Steam => {
+                        ui.label("Uno del gruppo crea una collezione del Workshop di Garry's Mod, ci mette almeno un addon e la pubblica (visibilità «Non in elenco» o «Solo amici»). Poi, nella pagina della collezione, aggiunge gli altri come collaboratori. Ognuno incolla qui lo stesso link.");
+                        ui.hyperlink_to(
+                            "Apri le tue collezioni di Garry's Mod su Steam",
+                            "https://steamcommunity.com/my/myworkshopfiles/?section=collections&appid=4000",
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Link della collezione:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.collection)
+                                    .desired_width(330.0)
+                                    .hint_text("https://steamcommunity.com/sharedfiles/filedetails/?id=..."),
+                            );
+                        });
+                        ui.label(RichText::new("Nota: lo storico qui sa chi ha fatto cosa solo per le modifiche fatte da questo PC; le altre compaiono come «qualcuno».").weak().small());
+                    }
+                    Mode::File => {
+                        ui.label("Il file deve stare in una cartella che si sincronizza da sola tra i vostri PC (Dropbox, Google Drive, OneDrive, Syncthing...). Il primo lo crea, gli altri scelgono lo stesso file nella loro copia della cartella.");
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Crea nuovo file…").clicked() {
+                                let mut dlg = rfd::FileDialog::new()
+                                    .set_title("Dove salvo il file del gruppo? (in una cartella condivisa)")
+                                    .set_file_name("gmod-workshop-sync.json")
+                                    .add_filter("File JSON", &["json"]);
+                                if let Some(h) = dirs::home_dir() {
+                                    dlg = dlg.set_directory(h);
+                                }
+                                if let Some(p) = dlg.save_file() {
+                                    d.path = p.display().to_string();
+                                }
+                            }
+                            if ui.button("Scegli file esistente…").clicked() {
+                                let mut dlg = rfd::FileDialog::new()
+                                    .set_title("Scegli il file del gruppo")
+                                    .add_filter("File JSON", &["json"]);
+                                if let Some(h) = dirs::home_dir() {
+                                    dlg = dlg.set_directory(h);
+                                }
+                                if let Some(p) = dlg.pick_file() {
+                                    d.path = p.display().to_string();
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("File:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.path)
+                                    .desired_width(420.0)
+                                    .hint_text("nessun file scelto"),
+                            );
+                        });
+                        if !d.path.trim().is_empty() && !looks_synced(&d.path) {
+                            ui.label(
+                                RichText::new("⚠ Questa cartella non sembra sincronizzata: se è solo sul tuo PC, gli altri non vedranno niente.")
+                                    .color(ORANGE)
+                                    .small(),
+                            );
+                        }
+                    }
+                    Mode::GitHub => {
+                        ui.label("Uno crea un repository GitHub (anche privato) e aggiunge gli altri come collaboratori. Ognuno crea un token «fine-grained» con permesso Contents: Read and write su quel repository e lo incolla qui.");
+                        ui.hyperlink_to(
+                            "Crea un token su GitHub",
+                            "https://github.com/settings/personal-access-tokens/new",
+                        );
+                        ui.add_space(4.0);
+                        egui::Grid::new("gh").num_columns(2).show(ui, |ui| {
+                            ui.label("Repository:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.gh_repo)
+                                    .desired_width(300.0)
+                                    .hint_text("utente/nome-repo"),
+                            );
+                            ui.end_row();
+                            ui.label("File nel repository:");
+                            ui.add(egui::TextEdit::singleline(&mut d.gh_path).desired_width(300.0));
+                            ui.end_row();
+                            ui.label("Token:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.gh_token)
+                                    .password(true)
+                                    .desired_width(300.0),
+                            );
+                            ui.end_row();
+                        });
+                        ui.label(RichText::new("Il token resta salvato solo su questo PC, nelle impostazioni del programma.").weak().small());
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Il tuo nome:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.nick)
+                            .desired_width(160.0)
+                            .hint_text(default_nick()),
+                    );
+                    ui.label(RichText::new("compare nello storico").weak().small());
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Salva").strong()).clicked() {
+                        save = true;
+                    }
+                });
+            });
+        if save {
+            actions.push(Action::SaveSettings);
+        } else if !open {
+            self.settings = None;
+        }
+    }
+
     fn plan_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let Some(plan) = self.plan.as_mut() else {
             return;
@@ -1679,6 +2550,12 @@ impl App {
                         }
                         if !plan.unsubscribe.is_empty() {
                             ui.add_space(6.0);
+                            if plan.unsubscribe.len() > 10 {
+                                ui.label(
+                                    RichText::new("⚠ Sono tanti: controlla che sia davvero quello che il gruppo vuole prima di applicare.")
+                                        .color(RED),
+                                );
+                            }
                             ui.strong(format!(
                                 "Da togliere dalle tue iscrizioni ({})",
                                 plan.unsubscribe.len()
@@ -1691,12 +2568,7 @@ impl App {
                 ui.separator();
                 let n = plan.subscribe.iter().filter(|x| x.3).count()
                     + plan.unsubscribe.iter().filter(|x| x.3).count();
-                let download: u64 = plan
-                    .subscribe
-                    .iter()
-                    .filter(|x| x.3)
-                    .map(|x| x.2)
-                    .sum();
+                let download: u64 = plan.subscribe.iter().filter(|x| x.3).map(|x| x.2).sum();
                 if download > 0 {
                     ui.label(format!("Da scaricare: {}", human_size(download)));
                 }
@@ -1730,7 +2602,7 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.label(format!(
-                    "{} addon verranno tolti a tutti: chi sincronizza dopo di te li perderà.",
+                    "{} addon verranno tolti dalla lista del gruppo: chi sincronizza dopo li perderà.",
                     ids.len()
                 ));
                 for t in &titles {
@@ -1807,7 +2679,7 @@ impl eframe::App for App {
         let rows = self.build_rows();
         let mut actions: Vec<Action> = Vec::new();
         self.header_panel(ctx, &mut actions);
-        if self.backend().is_none() {
+        if !self.cfg.configured() {
             self.log_panel(ctx);
             self.welcome_panel(ctx, &mut actions);
         } else {
@@ -1819,6 +2691,7 @@ impl eframe::App for App {
             self.confirm_window(ctx, &mut actions);
             self.history_window(ctx);
         }
+        self.settings_window(ctx, &mut actions);
         for a in actions {
             self.run(a);
         }
