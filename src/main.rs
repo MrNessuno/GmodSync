@@ -1660,13 +1660,13 @@ impl App {
             return;
         }
         unsafe {
-            let ugc = steamworks::sys::SteamAPI_SteamUGC_v021();
+            let ugc = steamworks_sys::SteamAPI_SteamUGC_v021();
             for id in &ids {
                 if let Ok(n) = id.parse::<u64>() {
                     if present {
-                        steamworks::sys::SteamAPI_ISteamUGC_AddDependency(ugc, col, n);
+                        steamworks_sys::SteamAPI_ISteamUGC_AddDependency(ugc, col, n);
                     } else {
-                        steamworks::sys::SteamAPI_ISteamUGC_RemoveDependency(ugc, col, n);
+                        steamworks_sys::SteamAPI_ISteamUGC_RemoveDependency(ugc, col, n);
                     }
                 }
             }
