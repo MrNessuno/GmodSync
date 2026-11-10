@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ['v*']
 
 jobs:
   build:
@@ -57,3 +58,31 @@ jobs:
             gmod-ws-sync-linux.tar.gz
             gmod-ws-sync-windows.zip
           if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: pacchetti
+          merge-multiple: true
+      - name: Crea la release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > note.md <<'NOTE'
+          Programma per tenere allineate le iscrizioni al Workshop di Garry's Mod tra amici.
+
+          **Windows:** scarica `gmod-ws-sync-windows.zip`, estrai tutto in una cartella e avvia `gmod-ws-sync.exe`.
+          **Linux:** scarica `gmod-ws-sync-linux.tar.gz`, estrai e avvia `avvia.sh`.
+
+          Serve Steam aperto con l'account che possiede Garry's Mod. Al primo avvio scegli dove tenere la lista del gruppo: collezione Steam, cartella condivisa o repository GitHub.
+          NOTE
+          gh release create "$GITHUB_REF_NAME" pacchetti/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Garry's Mod Workshop Sync $GITHUB_REF_NAME" \
+            --notes-file note.md
